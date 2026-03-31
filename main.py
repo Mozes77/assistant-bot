@@ -5,7 +5,7 @@ import telebot
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN",)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY",)
-OPENAI_MODEL = "gpt-5.4-mini"
+OPENAI_MODEL = "gpt-4o-mini"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
