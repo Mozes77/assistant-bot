@@ -2,12 +2,35 @@ import os
 import json
 import requests
 import telebot
+
+# =========================
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# =========================
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
 
+OPENAI_MODEL = "gpt-4o-mini"
 
-def get_company_by_inn(inn):
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_TOKEN")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("Не задан OPENAI_API_KEY")
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# =========================
+# DADATA
+# =========================
+
+def get_company_by_inn(inn: str):
+    if not DADATA_TOKEN:
+        return None
+
     url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
-    
+
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -18,34 +41,46 @@ def get_company_by_inn(inn):
         "query": inn
     }
 
-    response = requests.post(url, json=data, headers=headers)
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=30)
 
-    if response.status_code != 200:
+        if response.status_code != 200:
+            return None
+
+        result = response.json()
+        suggestions = result.get("suggestions", [])
+
+        if not suggestions:
+            return None
+
+        company = suggestions[0]["data"]
+
+        return {
+            "name": company.get("name", {}).get("full_with_opf"),
+            "address": company.get("address", {}).get("value"),
+            "ogrn": company.get("ogrn"),
+            "inn": company.get("inn")
+        }
+
+    except Exception:
         return None
 
-    result = response.json()
-
-    if not result.get("suggestions"):
-        return None
-
-    company = result["suggestions"][0]["data"]
-
-    return {
-        "name": company.get("name", {}).get("full_with_opf"),
-        "address": company.get("address", {}).get("value"),
-        "ogrn": company.get("ogrn"),
-        "inn": company.get("inn")
-    }
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN",)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY",)
-OPENAI_MODEL = "gpt-4o-mini"
-
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# =========================
+# OPENAI PROMPT
+# =========================
 
 SYSTEM_PROMPT = """
 Ты AI-роутер логистической системы.
 
-Твоя задача: разобрать сообщение пользователя и вернуть СТРОГО JSON.
+ВСЕГДА отвечай ТОЛЬКО на русском языке.
+Никакого английского текста.
+Ответ возвращай СТРОГО в формате JSON.
+
+Твоя задача:
+1. Понять, что хочет пользователь.
+2. Определить сценарий.
+3. Выделить известные данные.
+4. Указать, каких данных не хватает.
 
 Возможные scenario:
 - new_carrier_contract
@@ -55,6 +90,12 @@ SYSTEM_PROMPT = """
 - driver_issue
 - driver_expense
 - logistics_report
+- unknown
+
+Возможные role:
+- manager
+- driver
+- owner
 - unknown
 
 Ключевые поля, которые нужно извлекать, если они есть:
@@ -67,6 +108,7 @@ SYSTEM_PROMPT = """
 - registration_address
 - tax_mode
 - vat_mode
+- ogrn
 - route_from
 - route_to
 - route_name
@@ -84,18 +126,17 @@ SYSTEM_PROMPT = """
 - fuel_amount
 - fuel_liters
 
-Правила:
+Правила определения сценария:
 
 1) new_carrier_contract
-если пользователь пишет:
+Если пользователь пишет:
 - новый перевозчик
 - сделай договор
 - оформи нового перевозчика
-- заказчик ИП Галанина / ООО Фрукт Сервис
 - есть ИНН
 то это new_carrier_contract
 
-обязательные поля:
+Обязательные поля:
 - customer_name
 - inn ИЛИ carrier_name
 - phone
@@ -104,13 +145,13 @@ SYSTEM_PROMPT = """
 - tax_mode
 
 2) existing_carrier_trip_request
-если пользователь пишет:
+Если пользователь пишет:
 - сделай договор-заявку
 - рейс
 - заявка на рейс
 то это existing_carrier_trip_request
 
-обязательные поля:
+Обязательные поля:
 - customer_name
 - carrier_name
 - route_from ИЛИ route_name
@@ -118,72 +159,68 @@ SYSTEM_PROMPT = """
 - price
 
 3) create_waybill
-если пользователь пишет:
+Если пользователь пишет:
 - путевой лист
 то это create_waybill
 
-обязательные поля:
+Обязательные поля:
 - vehicle_number
 - driver_name
 - date
 
 4) driver_free
-если пользователь пишет:
+Если пользователь пишет:
 - свободен
 - товар сдал
 - разгрузился
 - документы позже
 то это driver_free
 
-обязательные поля:
-- driver_name если есть
-- vehicle_number если есть
+Обязательные поля:
 - факт сдачи груза
+- driver_name или vehicle_number, если указаны
 
 5) driver_issue
-если пользователь пишет:
+Если пользователь пишет:
 - замечание по машине
 - поломка
 - неисправность
 то это driver_issue
 
-обязательные поля:
+Обязательные поля:
 - vehicle_number
 - issue_text
 
 6) driver_expense
-если пользователь пишет:
+Если пользователь пишет:
 - заправка
 - купил масло
 - расход
 - потратил
 то это driver_expense
 
-обязательные поля:
+Обязательные поля:
 - vehicle_number
 - expense_type
 - expense_amount
 
 7) logistics_report
-если пользователь пишет:
+Если пользователь пишет:
 - расход за сегодня
 - логистика за 28 марта
 - сколько потратили
 то это logistics_report
 
-Ответ возвращай ТОЛЬКО в JSON, без пояснений вне JSON.
-
-Формат ответа:
+Верни JSON строго такого вида:
 
 {
   "role": "manager",
   "scenario": "new_carrier_contract",
   "known": {
-    "customer_name": "ИП Галанина",
     "inn": "381234567890"
   },
-  "missing": ["phone", "email", "registration_address", "tax_mode"],
-  "next_question": "Укажите телефон, email, адрес регистрации и налоговый режим."
+  "missing": ["customer_name", "phone", "email", "registration_address", "tax_mode"],
+  "next_question": "Укажите заказчика, телефон, email, адрес регистрации и налоговый режим."
 }
 
 Если сценарий неясен, верни:
@@ -197,6 +234,9 @@ SYSTEM_PROMPT = """
 }
 """
 
+# =========================
+# OPENAI REQUEST
+# =========================
 
 def ask_openai_router(user_text: str) -> dict:
     url = "https://api.openai.com/v1/responses"
@@ -246,6 +286,57 @@ def ask_openai_router(user_text: str) -> dict:
 
     return json.loads(output_text)
 
+# =========================
+# DADATA ENRICHMENT
+# =========================
+
+def enrich_result_with_dadata(result: dict) -> dict:
+    known = result.get("known", {}) or {}
+    missing = result.get("missing", []) or []
+
+    inn = known.get("inn")
+    if not inn:
+        return result
+
+    company = get_company_by_inn(inn)
+    if not company:
+        return result
+
+    if company.get("name") and not known.get("carrier_name"):
+        known["carrier_name"] = company["name"]
+
+    if company.get("address") and not known.get("registration_address"):
+        known["registration_address"] = company["address"]
+
+    if company.get("ogrn") and not known.get("ogrn"):
+        known["ogrn"] = company["ogrn"]
+
+    new_missing = []
+    for field in missing:
+        if field == "registration_address" and known.get("registration_address"):
+            continue
+        new_missing.append(field)
+
+    result["known"] = known
+    result["missing"] = new_missing
+
+    if result.get("scenario") == "new_carrier_contract":
+        if known.get("carrier_name") and known.get("registration_address"):
+            result["next_question"] = (
+                "Нашёл данные по ИНН. "
+                "Укажите заказчика, телефон, email и налоговый режим."
+            )
+        elif known.get("carrier_name"):
+            result["next_question"] = (
+                "Нашёл название по ИНН. "
+                "Укажите заказчика, телефон, email, адрес регистрации и налоговый режим."
+            )
+
+    return result
+
+# =========================
+# FORMATTING
+# =========================
 
 def format_router_result(result: dict) -> str:
     scenario = result.get("scenario", "unknown")
@@ -272,6 +363,35 @@ def format_router_result(result: dict) -> str:
         "unknown": "Не определено"
     }
 
+    field_labels = {
+        "customer_name": "заказчик",
+        "carrier_name": "название перевозчика",
+        "carrier_type": "тип перевозчика",
+        "inn": "ИНН",
+        "phone": "телефон",
+        "email": "email",
+        "registration_address": "адрес регистрации",
+        "tax_mode": "налоговый режим",
+        "vat_mode": "ставка НДС",
+        "ogrn": "ОГРН / ОГРНИП",
+        "route_from": "откуда",
+        "route_to": "куда",
+        "route_name": "маршрут",
+        "price": "цена",
+        "date": "дата",
+        "loading_time": "время загрузки",
+        "driver_name": "водитель",
+        "vehicle_number": "номер машины",
+        "pallets": "палеты",
+        "temperature_mode": "температурный режим",
+        "requires_medbook": "нужна медкнижка",
+        "issue_text": "замечание",
+        "expense_type": "тип расхода",
+        "expense_amount": "сумма расхода",
+        "fuel_amount": "сумма топлива",
+        "fuel_liters": "литры топлива"
+    }
+
     lines = []
     lines.append(f"Роль: {role_labels.get(role, role)}")
     lines.append(f"Сценарий: {scenario_labels.get(scenario, scenario)}")
@@ -280,13 +400,15 @@ def format_router_result(result: dict) -> str:
     if known:
         lines.append("Что я уже понял:")
         for k, v in known.items():
-            lines.append(f"• {k}: {v}")
+            label = field_labels.get(k, k)
+            lines.append(f"• {label}: {v}")
         lines.append("")
 
     if missing:
         lines.append("Чего не хватает:")
         for item in missing:
-            lines.append(f"• {item}")
+            label = field_labels.get(item, item)
+            lines.append(f"• {label}")
         lines.append("")
 
     if next_question:
@@ -295,23 +417,22 @@ def format_router_result(result: dict) -> str:
 
     return "\n".join(lines)
 
+# =========================
+# TELEGRAM HANDLERS
+# =========================
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
     bot.send_message(
         message.chat.id,
         "Бот запущен.\n\n"
-        "Сейчас он работает как AI-роутер:\n"
-        "понимает задачу, выделяет что уже известно и чего не хватает.\n\n"
-        "Примеры:\n"
-        "1) Сделай договор заказчик ИП Галанина с новым перевозчиком ИНН 381234567890\n"
-        "2) Сделай договор-заявку от ИП Галанина с ИП Тропиным рейс ИВИ - Слата ФРОВ цена 42000\n"
-        "3) Выписать путевой лист на 456 водитель Иванов дата 31.03.2026\n"
-        "4) Машина 456 свободен, товар сдал, документы позже\n"
-        "5) Замечание по машине 456: спустило колесо\n"
-        "6) Заправка 456 на 3200 рублей"
+        "Сейчас он умеет:\n"
+        "— понимать задачу\n"
+        "— определять сценарий\n"
+        "— подтягивать реквизиты по ИНН через DaData\n\n"
+        "Пример:\n"
+        "Сделай договор новый перевозчик ИНН 381234567890"
     )
-
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
@@ -323,12 +444,15 @@ def handle_text(message):
 
     try:
         result = ask_openai_router(user_text)
+        result = enrich_result_with_dadata(result)
         reply = format_router_result(result)
         bot.send_message(message.chat.id, reply)
     except Exception as e:
         bot.send_message(message.chat.id, f"Ошибка:\n{str(e)}")
 
+# =========================
+# START
+# =========================
 
 if __name__ == "__main__":
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
-#restart
