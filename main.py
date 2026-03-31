@@ -1,7 +1,12 @@
 import os
 import json
+import re
 import requests
 import telebot
+
+# =========================
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# =========================
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -91,7 +96,6 @@ SYSTEM_PROMPT = """
 - email
 - registration_address
 - tax_mode
-- vat_mode
 - ogrn
 - route_from
 - route_to
@@ -191,7 +195,7 @@ SYSTEM_PROMPT = """
 7) logistics_report
 Если пользователь пишет:
 - расход за сегодня
-- логистика за 28 марта
+- логистика за дату
 - сколько потратили
 то это logistics_report
 
@@ -204,7 +208,7 @@ SYSTEM_PROMPT = """
     "inn": "381234567890"
   },
   "missing": ["customer_name", "phone", "email", "registration_address", "tax_mode"],
-  "next_question": "Укажите заказчика, телефон, email, адрес регистрации и налоговый режим."
+  "next_question": "Укажите заказчика, телефон, email, адрес регистрации и налогообложение (с НДС или без НДС)."
 }
 
 Если сценарий неясен, верни:
@@ -301,7 +305,7 @@ def enrich_result_with_dadata(result: dict) -> dict:
         if known.get("carrier_name") and known.get("registration_address"):
             result["next_question"] = (
                 "Нашёл данные по ИНН. "
-                "Укажите заказчика, телефон, email и налоговый режим."
+                "Пришлите одним сообщением: заказчик, телефон, email, налогообложение (с НДС или без НДС)."
             )
 
     return result
@@ -359,8 +363,7 @@ def format_router_result(result: dict) -> str:
         "phone": "телефон",
         "email": "email",
         "registration_address": "адрес регистрации",
-        "tax_mode": "налоговый режим",
-        "vat_mode": "ставка НДС",
+        "tax_mode": "налогообложение",
         "ogrn": "ОГРН / ОГРНИП",
         "route_from": "откуда",
         "route_to": "куда",
@@ -422,6 +425,88 @@ def clear_session(chat_id: int):
         del SESSION_STORE[chat_id]
 
 # =========================
+# HELPERS FOR INPUT PARSING
+# =========================
+
+def normalize_tax_mode(text: str) -> str:
+    t = (text or "").lower()
+
+    if "без ндс" in t:
+        return "без НДС"
+    if "с ндс" in t:
+        return "с НДС"
+
+    return ""
+
+def extract_email(text: str) -> str:
+    match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
+    return match.group(0) if match else ""
+
+def extract_phone(text: str) -> str:
+    match = re.search(r'(\+7|8)[\d\-\s\(\)]{9,}', text)
+    if not match:
+        return ""
+    return match.group(0).strip()
+
+def detect_customer_name(text: str) -> str:
+    t = (text or "").lower()
+
+    if "фрукт сервис" in t:
+        return "ООО Фрукт Сервис"
+    if "галанин" in t:
+        return "ИП Галанина Людмила Емельяновна"
+    if "атлант" in t:
+        return "ООО Атлант"
+    if "ип минин" in t or "минин" in t:
+        return "ИП Минин"
+
+    return ""
+
+def parse_bulk_reply(text: str, session: dict) -> dict:
+    parsed = dict(session)
+
+    customer_name = detect_customer_name(text)
+    if customer_name and not parsed.get("customer_name"):
+        parsed["customer_name"] = customer_name
+
+    phone = extract_phone(text)
+    if phone and not parsed.get("phone"):
+        parsed["phone"] = phone
+
+    email = extract_email(text)
+    if email and not parsed.get("email"):
+        parsed["email"] = email
+
+    tax_mode = normalize_tax_mode(text)
+    if tax_mode and not parsed.get("tax_mode"):
+        parsed["tax_mode"] = tax_mode
+
+    return parsed
+
+def missing_session_fields(session: dict):
+    required = ["customer_name", "phone", "email", "tax_mode"]
+    missing = []
+
+    for field in required:
+        if not session.get(field):
+            missing.append(field)
+
+    return missing
+
+def format_missing_for_user(missing: list) -> str:
+    labels = {
+        "customer_name": "заказчик",
+        "phone": "телефон",
+        "email": "email",
+        "tax_mode": "налогообложение (с НДС или без НДС)"
+    }
+
+    lines = ["Не хватает:"]
+    for item in missing:
+        lines.append(f"• {labels.get(item, item)}")
+    return "\n".join(lines)
+
+# =========================
 # TELEGRAM
 # =========================
 
@@ -451,63 +536,56 @@ def handle_text(message):
     try:
         session = get_session(chat_id)
 
-        # Если уже есть незавершённый сценарий нового перевозчика
+        # Если уже ждём доп.данные по новому перевозчику
         if session.get("scenario") == "new_carrier_contract" and session.get("awaiting_more_data"):
-            text_lower = user_text.lower()
+            session = parse_bulk_reply(user_text, session)
+            save_session(chat_id, session)
 
-            if not session.get("customer_name"):
-                session["customer_name"] = user_text.strip()
-                save_session(chat_id, session)
-                bot.send_message(chat_id, "Укажите телефон перевозчика.")
+            still_missing = missing_session_fields(session)
+            if still_missing:
+                bot.send_message(
+                    chat_id,
+                    format_missing_for_user(still_missing) +
+                    "\n\nПришлите недостающие данные одним сообщением."
+                )
                 return
 
-            if not session.get("phone"):
-                session["phone"] = user_text.strip()
-                save_session(chat_id, session)
-                bot.send_message(chat_id, "Укажите email перевозчика.")
-                return
+            payload = {
+                "action": "create_carrier_and_contract",
+                "customer_name": session.get("customer_name", ""),
+                "name": session.get("carrier_name", ""),
+                "inn": session.get("inn", ""),
+                "ogrn": session.get("ogrn", ""),
+                "address": session.get("registration_address", ""),
+                "phone": session.get("phone", ""),
+                "email": session.get("email", ""),
+                "tax_mode": session.get("tax_mode", "")
+            }
 
-            if not session.get("email"):
-                session["email"] = user_text.strip()
-                save_session(chat_id, session)
-                bot.send_message(chat_id, "Укажите налоговый режим. Например: НДС 5%, НДС 20%, без НДС, патент.")
-                return
+            gs_result = call_google_script(payload)
+            clear_session(chat_id)
 
-            if not session.get("tax_mode"):
-                session["tax_mode"] = user_text.strip()
+            if gs_result.get("ok"):
+                result = gs_result.get("result", {})
+                created_text = "создан" if result.get("created") else "обновлён"
 
-                payload = {
-                    "action": "create_carrier_and_contract",
-                    "customer_name": session.get("customer_name", ""),
-                    "name": session.get("carrier_name", ""),
-                    "inn": session.get("inn", ""),
-                    "ogrn": session.get("ogrn", ""),
-                    "address": session.get("registration_address", ""),
-                    "phone": session.get("phone", ""),
-                    "email": session.get("email", ""),
-                    "tax_mode": session.get("tax_mode", "")
-                }
+                bot.send_message(
+                    chat_id,
+                    "Готово.\n\n"
+                    f"Перевозчик {created_text} в базе.\n"
+                    f"Договор создан.\n\n"
+                    f"Номер договора: {result.get('contractNumber', '-')}\n"
+                    f"Документ: {result.get('docUrl', '-')}\n"
+                    f"PDF: {result.get('pdfUrl', '-')}"
+                )
+            else:
+                bot.send_message(
+                    chat_id,
+                    f"Ошибка Google Script:\n{gs_result.get('error', 'Неизвестная ошибка')}"
+                )
+            return
 
-                gs_result = call_google_script(payload)
-
-                clear_session(chat_id)
-
-                if gs_result.get("ok"):
-                    result = gs_result.get("result", {})
-                    bot.send_message(
-                        chat_id,
-                        "Готово.\n\n"
-                        f"Перевозчик занесён в базу.\n"
-                        f"Договор создан.\n\n"
-                        f"Номер договора: {result.get('contractNumber', '-')}\n"
-                        f"Документ: {result.get('docUrl', '-')}\n"
-                        f"PDF: {result.get('pdfUrl', '-')}"
-                    )
-                else:
-                    bot.send_message(chat_id, f"Ошибка Google Script:\n{gs_result.get('error', 'Неизвестная ошибка')}")
-                return
-
-        # Новый входящий запрос
+        # Новый запрос
         result = ask_openai_router(user_text)
         result = enrich_result_with_dadata(result)
         reply = format_router_result(result)
