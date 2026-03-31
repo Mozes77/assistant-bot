@@ -14,10 +14,10 @@ DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
 OPENAI_MODEL = "gpt-4o-mini"
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Не задан TELEGRAM_TOKEN")
+    print("❌ Нет TELEGRAM_TOKEN")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("Не задан OPENAI_API_KEY")
+    print("❌ Нет OPENAI_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
