@@ -3,21 +3,12 @@ import json
 import requests
 import telebot
 
-# =========================
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# =========================
-
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
+GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
 OPENAI_MODEL = "gpt-4o-mini"
-
-if not TELEGRAM_TOKEN:
-    print("❌ Нет TELEGRAM_TOKEN")
-
-if not OPENAI_API_KEY:
-    print("❌ Нет OPENAI_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
@@ -30,26 +21,20 @@ def get_company_by_inn(inn: str):
         return None
 
     url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
-
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Token {DADATA_TOKEN}"
     }
-
-    data = {
-        "query": inn
-    }
+    data = {"query": inn}
 
     try:
         response = requests.post(url, json=data, headers=headers, timeout=30)
-
         if response.status_code != 200:
             return None
 
         result = response.json()
         suggestions = result.get("suggestions", [])
-
         if not suggestions:
             return None
 
@@ -61,7 +46,6 @@ def get_company_by_inn(inn: str):
             "ogrn": company.get("ogrn"),
             "inn": company.get("inn")
         }
-
     except Exception:
         return None
 
@@ -235,7 +219,7 @@ SYSTEM_PROMPT = """
 """
 
 # =========================
-# OPENAI REQUEST
+# OPENAI
 # =========================
 
 def ask_openai_router(user_text: str) -> dict:
@@ -244,14 +228,8 @@ def ask_openai_router(user_text: str) -> dict:
     payload = {
         "model": OPENAI_MODEL,
         "input": [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": user_text
-            }
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text}
         ],
         "store": False
     }
@@ -273,8 +251,7 @@ def ask_openai_router(user_text: str) -> dict:
         output = data.get("output", [])
         for item in output:
             if item.get("type") == "message":
-                content = item.get("content", [])
-                for c in content:
+                for c in item.get("content", []):
                     if c.get("type") in ("output_text", "text"):
                         output_text += c.get("text", "")
 
@@ -326,16 +303,27 @@ def enrich_result_with_dadata(result: dict) -> dict:
                 "Нашёл данные по ИНН. "
                 "Укажите заказчика, телефон, email и налоговый режим."
             )
-        elif known.get("carrier_name"):
-            result["next_question"] = (
-                "Нашёл название по ИНН. "
-                "Укажите заказчика, телефон, email, адрес регистрации и налоговый режим."
-            )
 
     return result
 
 # =========================
-# FORMATTING
+# GOOGLE SCRIPT
+# =========================
+
+def call_google_script(payload: dict):
+    if not GOOGLE_SCRIPT_URL:
+        raise RuntimeError("Не задан GOOGLE_SCRIPT_URL")
+
+    response = requests.post(
+        GOOGLE_SCRIPT_URL,
+        json=payload,
+        timeout=120
+    )
+    response.raise_for_status()
+    return response.json()
+
+# =========================
+# FORMAT
 # =========================
 
 def format_router_result(result: dict) -> str:
@@ -418,7 +406,23 @@ def format_router_result(result: dict) -> str:
     return "\n".join(lines)
 
 # =========================
-# TELEGRAM HANDLERS
+# SESSION MEMORY
+# =========================
+
+SESSION_STORE = {}
+
+def get_session(chat_id: int):
+    return SESSION_STORE.get(chat_id, {})
+
+def save_session(chat_id: int, data: dict):
+    SESSION_STORE[chat_id] = data
+
+def clear_session(chat_id: int):
+    if chat_id in SESSION_STORE:
+        del SESSION_STORE[chat_id]
+
+# =========================
+# TELEGRAM
 # =========================
 
 @bot.message_handler(commands=["start"])
@@ -429,30 +433,107 @@ def handle_start(message):
         "Сейчас он умеет:\n"
         "— понимать задачу\n"
         "— определять сценарий\n"
-        "— подтягивать реквизиты по ИНН через DaData\n\n"
+        "— подтягивать реквизиты по ИНН через DaData\n"
+        "— создавать договор через Google Script после сбора данных\n\n"
         "Пример:\n"
         "Сделай договор новый перевозчик ИНН 381234567890"
     )
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
+    chat_id = message.chat.id
     user_text = message.text.strip()
 
     if not user_text:
-        bot.send_message(message.chat.id, "Пустое сообщение.")
+        bot.send_message(chat_id, "Пустое сообщение.")
         return
 
     try:
+        session = get_session(chat_id)
+
+        # Если уже есть незавершённый сценарий нового перевозчика
+        if session.get("scenario") == "new_carrier_contract" and session.get("awaiting_more_data"):
+            text_lower = user_text.lower()
+
+            if not session.get("customer_name"):
+                session["customer_name"] = user_text.strip()
+                save_session(chat_id, session)
+                bot.send_message(chat_id, "Укажите телефон перевозчика.")
+                return
+
+            if not session.get("phone"):
+                session["phone"] = user_text.strip()
+                save_session(chat_id, session)
+                bot.send_message(chat_id, "Укажите email перевозчика.")
+                return
+
+            if not session.get("email"):
+                session["email"] = user_text.strip()
+                save_session(chat_id, session)
+                bot.send_message(chat_id, "Укажите налоговый режим. Например: НДС 5%, НДС 20%, без НДС, патент.")
+                return
+
+            if not session.get("tax_mode"):
+                session["tax_mode"] = user_text.strip()
+
+                payload = {
+                    "action": "create_carrier_and_contract",
+                    "customer_name": session.get("customer_name", ""),
+                    "name": session.get("carrier_name", ""),
+                    "inn": session.get("inn", ""),
+                    "ogrn": session.get("ogrn", ""),
+                    "address": session.get("registration_address", ""),
+                    "phone": session.get("phone", ""),
+                    "email": session.get("email", ""),
+                    "tax_mode": session.get("tax_mode", "")
+                }
+
+                gs_result = call_google_script(payload)
+
+                clear_session(chat_id)
+
+                if gs_result.get("ok"):
+                    result = gs_result.get("result", {})
+                    bot.send_message(
+                        chat_id,
+                        "Готово.\n\n"
+                        f"Перевозчик занесён в базу.\n"
+                        f"Договор создан.\n\n"
+                        f"Номер договора: {result.get('contractNumber', '-')}\n"
+                        f"Документ: {result.get('docUrl', '-')}\n"
+                        f"PDF: {result.get('pdfUrl', '-')}"
+                    )
+                else:
+                    bot.send_message(chat_id, f"Ошибка Google Script:\n{gs_result.get('error', 'Неизвестная ошибка')}")
+                return
+
+        # Новый входящий запрос
         result = ask_openai_router(user_text)
         result = enrich_result_with_dadata(result)
         reply = format_router_result(result)
-        bot.send_message(message.chat.id, reply)
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Ошибка:\n{str(e)}")
+        bot.send_message(chat_id, reply)
 
-# =========================
-# START
-# =========================
+        if result.get("scenario") == "new_carrier_contract":
+            known = result.get("known", {})
+            missing = result.get("missing", [])
+
+            if missing:
+                session_data = {
+                    "scenario": "new_carrier_contract",
+                    "awaiting_more_data": True,
+                    "customer_name": known.get("customer_name", ""),
+                    "carrier_name": known.get("carrier_name", ""),
+                    "inn": known.get("inn", ""),
+                    "ogrn": known.get("ogrn", ""),
+                    "registration_address": known.get("registration_address", ""),
+                    "phone": known.get("phone", ""),
+                    "email": known.get("email", ""),
+                    "tax_mode": known.get("tax_mode", "")
+                }
+                save_session(chat_id, session_data)
+
+    except Exception as e:
+        bot.send_message(chat_id, f"Ошибка:\n{str(e)}")
 
 if __name__ == "__main__":
-   bot.infinity_polling(skip_pending=True)
+    bot.infinity_polling(skip_pending=True)
