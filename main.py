@@ -2,7 +2,40 @@ import os
 import json
 import requests
 import telebot
+DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
 
+
+def get_company_by_inn(inn):
+    url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Token {DADATA_TOKEN}"
+    }
+
+    data = {
+        "query": inn
+    }
+
+    response = requests.post(url, json=data, headers=headers)
+
+    if response.status_code != 200:
+        return None
+
+    result = response.json()
+
+    if not result.get("suggestions"):
+        return None
+
+    company = result["suggestions"][0]["data"]
+
+    return {
+        "name": company.get("name", {}).get("full_with_opf"),
+        "address": company.get("address", {}).get("value"),
+        "ogrn": company.get("ogrn"),
+        "inn": company.get("inn")
+    }
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN",)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY",)
 OPENAI_MODEL = "gpt-4o-mini"
