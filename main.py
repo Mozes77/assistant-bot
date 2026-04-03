@@ -12,7 +12,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
-
+print("GOOGLE_SCRIPT_URL =", GOOGLE_SCRIPT_URL)
 OPENAI_MODEL = "gpt-4o-mini"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
