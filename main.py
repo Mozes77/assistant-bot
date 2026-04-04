@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import base64
 import requests
 import telebot
 
@@ -13,12 +14,12 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
-OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 # =========================
-# ХРАНЕНИЕ СЕССИЙ
+# ПРОСТОЕ ХРАНЕНИЕ СЕССИЙ
 # =========================
 
 SESSION_STORE = {}
@@ -61,34 +62,19 @@ def get_company_by_inn(inn: str):
 
         company = suggestions[0]["data"]
 
-        legal_form = detect_legal_form_from_dadata(company)
-
         return {
             "name": company.get("name", {}).get("full_with_opf") or "",
             "address": company.get("address", {}).get("value") or "",
             "ogrn": company.get("ogrn") or "",
             "inn": company.get("inn") or "",
-            "legal_form": legal_form
+            "director": "",
+            "carrier_type": detect_legal_form_from_name(company.get("name", {}).get("full_with_opf") or "")
         }
     except Exception:
         return None
 
-def detect_legal_form_from_dadata(company: dict) -> str:
-    opf_full = ((company.get("opf") or {}).get("full") or "").lower()
-    opf_short = ((company.get("opf") or {}).get("short") or "").lower()
-    name_full = ((company.get("name") or {}).get("full_with_opf") or "").lower()
-
-    source = f"{opf_full} {opf_short} {name_full}"
-
-    if "общество с ограниченной ответственностью" in source or "ооо" in source:
-        return "ООО"
-    if "индивидуальный предприниматель" in source or "ип" in source:
-        return "ИП"
-
-    return "ИП"
-
 # =========================
-# OPENAI PROMPT
+# OPENAI ROUTER
 # =========================
 
 SYSTEM_PROMPT = """
@@ -130,6 +116,7 @@ SYSTEM_PROMPT = """
 - registration_address
 - tax_mode
 - ogrn
+- director
 - bank
 - rs
 - bik
@@ -262,10 +249,6 @@ SYSTEM_PROMPT = """
 }
 """
 
-# =========================
-# OPENAI
-# =========================
-
 def ask_openai_router(user_text: str) -> dict:
     url = "https://api.openai.com/v1/responses"
 
@@ -287,28 +270,86 @@ def ask_openai_router(user_text: str) -> dict:
     response.raise_for_status()
     data = response.json()
 
-    output_text = ""
-
-    if "output_text" in data and data["output_text"]:
-        output_text = data["output_text"]
-    else:
-        output = data.get("output", [])
-        for item in output:
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") in ("output_text", "text"):
-                        output_text += c.get("text", "")
-
-    output_text = output_text.strip()
-
-    if output_text.startswith("```"):
-        output_text = output_text.strip("`")
-        output_text = output_text.replace("json", "", 1).strip()
-
-    return json.loads(output_text)
+    output_text = extract_output_text(data)
+    return safe_json_loads(output_text)
 
 # =========================
-# ОБОГАЩЕНИЕ ЧЕРЕЗ DADATA
+# OPENAI VISION ДЛЯ КАРТОЧКИ
+# =========================
+
+def download_telegram_file(file_id: str) -> bytes:
+    file_info = bot.get_file(file_id)
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+    response = requests.get(file_url, timeout=60)
+    response.raise_for_status()
+    return response.content
+
+def extract_card_data_from_image(image_bytes: bytes) -> dict:
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = """
+Ты извлекаешь реквизиты перевозчика с фото карточки предприятия.
+Нужно вернуть ТОЛЬКО JSON без пояснений.
+
+Если поле не найдено — верни пустую строку.
+
+Поля:
+- carrier_name
+- carrier_short_name
+- carrier_type
+- inn
+- ogrn
+- registration_address
+- phone
+- email
+- bank
+- bank_city
+- rs
+- ks
+- bik
+- director
+
+Правила:
+- Если это ИП, carrier_type = "ИП"
+- Если это ООО, carrier_type = "ООО"
+- Если это самозанятый, carrier_type = "САМОЗАНЯТЫЙ"
+- ОГРНИП записывай в поле ogrn
+- Если видишь ФИО ИП, director можно продублировать этим же ФИО
+- Верни строго JSON
+"""
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{base64_image}",
+                        "detail": "high"
+                    }
+                ]
+            }
+        ],
+        "store": False
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=120)
+    response.raise_for_status()
+    data = response.json()
+
+    output_text = extract_output_text(data)
+    return safe_json_loads(output_text)
+
+# =========================
+# ОБОГАЩЕНИЕ РЕЗУЛЬТАТА DADATA
 # =========================
 
 def enrich_result_with_dadata(result: dict) -> dict:
@@ -332,8 +373,11 @@ def enrich_result_with_dadata(result: dict) -> dict:
     if company.get("ogrn") and not known.get("ogrn"):
         known["ogrn"] = company["ogrn"]
 
-    if company.get("legal_form") and not known.get("carrier_type"):
-        known["carrier_type"] = company["legal_form"]
+    if company.get("carrier_type") and not known.get("carrier_type"):
+        known["carrier_type"] = company["carrier_type"]
+
+    if company.get("director") and not known.get("director"):
+        known["director"] = company["director"]
 
     new_missing = []
     for field in missing:
@@ -408,6 +452,7 @@ def format_router_result(result: dict) -> str:
         "registration_address": "адрес регистрации",
         "tax_mode": "налогообложение",
         "ogrn": "ОГРН / ОГРНИП",
+        "director": "директор / подписант",
         "bank": "банк",
         "rs": "расчетный счет",
         "bik": "БИК",
@@ -485,20 +530,8 @@ def extract_phone(text: str) -> str:
         return ""
     return match.group(0).strip()
 
-def extract_inn(text: str) -> str:
-    match = re.search(r'\b\d{10,12}\b', text)
-    return match.group(0) if match else ""
-
 def extract_bik(text: str) -> str:
     match = re.search(r'\b\d{9}\b', text)
-    return match.group(0) if match else ""
-
-def extract_rs(text: str) -> str:
-    match = re.search(r'\b\d{20}\b', text)
-    return match.group(0) if match else ""
-
-def extract_ks(text: str) -> str:
-    match = re.search(r'\b3010\d{16}\b', text)
     return match.group(0) if match else ""
 
 def detect_customer_name(text: str) -> str:
@@ -512,7 +545,6 @@ def detect_customer_name(text: str) -> str:
 
 def detect_customer_code(customer_name: str) -> str:
     t = (customer_name or "").lower()
-
     if "галанин" in t:
         return "GALANINA_IP"
     return "FRUKT_SERVICE"
@@ -542,6 +574,17 @@ def detect_bank_name(text: str) -> str:
 
     return ""
 
+def detect_legal_form_from_name(name: str) -> str:
+    t = (name or "").lower()
+    if "ооо" in t or "общество с ограниченной ответственностью" in t:
+        return "ООО"
+    if "самозан" in t:
+        return "САМОЗАНЯТЫЙ"
+    return "ИП"
+
+def extract_all_20_accounts(text: str):
+    return re.findall(r'\b\d{20}\b', text or "")
+
 def parse_bulk_reply(text: str, session: dict) -> dict:
     parsed = dict(session)
 
@@ -565,8 +608,7 @@ def parse_bulk_reply(text: str, session: dict) -> dict:
     if bank and not parsed.get("bank"):
         parsed["bank"] = bank
 
-    # извлекаем все 20-значные счета
-    all_20 = re.findall(r'\b\d{20}\b', text)
+    all_20 = extract_all_20_accounts(text)
     if all_20:
         if not parsed.get("rs"):
             parsed["rs"] = all_20[0]
@@ -607,6 +649,32 @@ def format_missing_for_user(missing: list) -> str:
     return "\n".join(lines)
 
 # =========================
+# СЛУЖЕБНЫЕ
+# =========================
+
+def extract_output_text(data: dict) -> str:
+    output_text = ""
+
+    if "output_text" in data and data["output_text"]:
+        output_text = data["output_text"]
+    else:
+        output = data.get("output", [])
+        for item in output:
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    if c.get("type") in ("output_text", "text"):
+                        output_text += c.get("text", "")
+
+    return output_text.strip()
+
+def safe_json_loads(output_text: str) -> dict:
+    if output_text.startswith("```"):
+        output_text = output_text.strip("`")
+        output_text = output_text.replace("json", "", 1).strip()
+
+    return json.loads(output_text)
+
+# =========================
 # TELEGRAM
 # =========================
 
@@ -618,16 +686,86 @@ def handle_start(message):
         "Сейчас он умеет:\n"
         "— понимать задачу\n"
         "— подтягивать реквизиты по ИНН через DaData\n"
+        "— считывать карточку предприятия с фото\n"
         "— дозапрашивать недостающие данные\n"
         "— создавать перевозчика и договор через Google Script\n\n"
-        "Пример:\n"
-        "Сделай договор новый перевозчик ИНН 381234567890"
+        "Примеры:\n"
+        "1) Сделай договор новый перевозчик ИНН 381250673578\n"
+        "2) Отправь фото карточки предприятия"
     )
 
 @bot.message_handler(commands=["reset", "clear"])
 def handle_reset(message):
     clear_session(message.chat.id)
     bot.send_message(message.chat.id, "Сессия очищена.")
+
+@bot.message_handler(content_types=["photo"])
+def handle_photo(message):
+    chat_id = message.chat.id
+
+    try:
+        largest_photo = message.photo[-1]
+        file_id = largest_photo.file_id
+
+        bot.send_message(chat_id, "Получил фото. Считываю реквизиты с карточки...")
+
+        image_bytes = download_telegram_file(file_id)
+        extracted = extract_card_data_from_image(image_bytes)
+
+        session = get_session(chat_id)
+        session["scenario"] = "new_carrier_contract"
+        session["awaiting_more_data"] = True
+
+        session["carrier_name"] = extracted.get("carrier_name", "")
+        session["carrier_type"] = extracted.get("carrier_type", "") or detect_legal_form_from_name(extracted.get("carrier_name", ""))
+        session["inn"] = extracted.get("inn", "")
+        session["ogrn"] = extracted.get("ogrn", "")
+        session["registration_address"] = extracted.get("registration_address", "")
+        session["phone"] = extracted.get("phone", "")
+        session["email"] = extracted.get("email", "")
+        session["bank"] = extracted.get("bank", "")
+        session["rs"] = extracted.get("rs", "")
+        session["ks"] = extracted.get("ks", "")
+        session["bik"] = extracted.get("bik", "")
+        session["director"] = extracted.get("director", "")
+        session["customer_name"] = session.get("customer_name", "")
+        session["tax_mode"] = session.get("tax_mode", "")
+
+        save_session(chat_id, session)
+
+        lines = ["Нашёл по карточке:"]
+        for key, label in [
+            ("carrier_name", "Название"),
+            ("carrier_type", "Тип"),
+            ("inn", "ИНН"),
+            ("ogrn", "ОГРН / ОГРНИП"),
+            ("registration_address", "Адрес"),
+            ("phone", "Телефон"),
+            ("email", "Email"),
+            ("bank", "Банк"),
+            ("rs", "Расчетный счет"),
+            ("ks", "Корр. счет"),
+            ("bik", "БИК"),
+        ]:
+            value = session.get(key, "")
+            if value:
+                lines.append(f"• {label}: {value}")
+
+        missing = missing_session_fields(session)
+
+        if missing:
+            lines.append("")
+            lines.append(format_missing_for_user(missing))
+            lines.append("")
+            lines.append("Пришлите недостающие данные одним сообщением.")
+        else:
+            lines.append("")
+            lines.append("Данных достаточно для создания. Если нужно, отправьте заказчика отдельным сообщением.")
+
+        bot.send_message(chat_id, "\n".join(lines))
+
+    except Exception as e:
+        bot.send_message(chat_id, f"Ошибка при чтении карточки:\n{str(e)}")
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
