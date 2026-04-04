@@ -12,10 +12,26 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
-print("GOOGLE_SCRIPT_URL =", GOOGLE_SCRIPT_URL)
+
 OPENAI_MODEL = "gpt-4o-mini"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# =========================
+# ХРАНЕНИЕ СЕССИЙ
+# =========================
+
+SESSION_STORE = {}
+
+def get_session(chat_id: int):
+    return SESSION_STORE.get(chat_id, {})
+
+def save_session(chat_id: int, data: dict):
+    SESSION_STORE[chat_id] = data
+
+def clear_session(chat_id: int):
+    if chat_id in SESSION_STORE:
+        del SESSION_STORE[chat_id]
 
 # =========================
 # DADATA
@@ -45,14 +61,31 @@ def get_company_by_inn(inn: str):
 
         company = suggestions[0]["data"]
 
+        legal_form = detect_legal_form_from_dadata(company)
+
         return {
-            "name": company.get("name", {}).get("full_with_opf"),
-            "address": company.get("address", {}).get("value"),
-            "ogrn": company.get("ogrn"),
-            "inn": company.get("inn")
+            "name": company.get("name", {}).get("full_with_opf") or "",
+            "address": company.get("address", {}).get("value") or "",
+            "ogrn": company.get("ogrn") or "",
+            "inn": company.get("inn") or "",
+            "legal_form": legal_form
         }
     except Exception:
         return None
+
+def detect_legal_form_from_dadata(company: dict) -> str:
+    opf_full = ((company.get("opf") or {}).get("full") or "").lower()
+    opf_short = ((company.get("opf") or {}).get("short") or "").lower()
+    name_full = ((company.get("name") or {}).get("full_with_opf") or "").lower()
+
+    source = f"{opf_full} {opf_short} {name_full}"
+
+    if "общество с ограниченной ответственностью" in source or "ооо" in source:
+        return "ООО"
+    if "индивидуальный предприниматель" in source or "ип" in source:
+        return "ИП"
+
+    return "ИП"
 
 # =========================
 # OPENAI PROMPT
@@ -97,6 +130,10 @@ SYSTEM_PROMPT = """
 - registration_address
 - tax_mode
 - ogrn
+- bank
+- rs
+- bik
+- ks
 - route_from
 - route_to
 - route_name
@@ -129,7 +166,10 @@ SYSTEM_PROMPT = """
 - inn ИЛИ carrier_name
 - phone
 - email
-- registration_address
+- bank
+- rs
+- bik
+- ks
 - tax_mode
 
 2) existing_carrier_trip_request
@@ -207,8 +247,8 @@ SYSTEM_PROMPT = """
   "known": {
     "inn": "381234567890"
   },
-  "missing": ["customer_name", "phone", "email", "registration_address", "tax_mode"],
-  "next_question": "Укажите заказчика, телефон, email, адрес регистрации и налогообложение (с НДС или без НДС)."
+  "missing": ["customer_name", "phone", "email", "bank", "rs", "bik", "ks", "tax_mode"],
+  "next_question": "Укажите заказчика, телефон, email, банк, расчетный счет, БИК, корр. счет и налогообложение."
 }
 
 Если сценарий неясен, верни:
@@ -268,7 +308,7 @@ def ask_openai_router(user_text: str) -> dict:
     return json.loads(output_text)
 
 # =========================
-# DADATA ENRICHMENT
+# ОБОГАЩЕНИЕ ЧЕРЕЗ DADATA
 # =========================
 
 def enrich_result_with_dadata(result: dict) -> dict:
@@ -292,6 +332,9 @@ def enrich_result_with_dadata(result: dict) -> dict:
     if company.get("ogrn") and not known.get("ogrn"):
         known["ogrn"] = company["ogrn"]
 
+    if company.get("legal_form") and not known.get("carrier_type"):
+        known["carrier_type"] = company["legal_form"]
+
     new_missing = []
     for field in missing:
         if field == "registration_address" and known.get("registration_address"):
@@ -302,11 +345,11 @@ def enrich_result_with_dadata(result: dict) -> dict:
     result["missing"] = new_missing
 
     if result.get("scenario") == "new_carrier_contract":
-        if known.get("carrier_name") and known.get("registration_address"):
-            result["next_question"] = (
-                "Нашёл данные по ИНН. "
-                "Пришлите одним сообщением: заказчик, телефон, email, налогообложение (с НДС или без НДС)."
-            )
+        result["next_question"] = (
+            "Нашёл данные по ИНН.\n"
+            "Пришлите одним сообщением:\n"
+            "заказчик, телефон, email, банк, расчетный счет, БИК, корр. счет, налогообложение."
+        )
 
     return result
 
@@ -327,7 +370,7 @@ def call_google_script(payload: dict):
     return response.json()
 
 # =========================
-# FORMAT
+# ФОРМАТ ОТВЕТА
 # =========================
 
 def format_router_result(result: dict) -> str:
@@ -365,6 +408,10 @@ def format_router_result(result: dict) -> str:
         "registration_address": "адрес регистрации",
         "tax_mode": "налогообложение",
         "ogrn": "ОГРН / ОГРНИП",
+        "bank": "банк",
+        "rs": "расчетный счет",
+        "bik": "БИК",
+        "ks": "корр. счет",
         "route_from": "откуда",
         "route_to": "куда",
         "route_name": "маршрут",
@@ -409,23 +456,7 @@ def format_router_result(result: dict) -> str:
     return "\n".join(lines)
 
 # =========================
-# SESSION MEMORY
-# =========================
-
-SESSION_STORE = {}
-
-def get_session(chat_id: int):
-    return SESSION_STORE.get(chat_id, {})
-
-def save_session(chat_id: int, data: dict):
-    SESSION_STORE[chat_id] = data
-
-def clear_session(chat_id: int):
-    if chat_id in SESSION_STORE:
-        del SESSION_STORE[chat_id]
-
-# =========================
-# HELPERS FOR INPUT PARSING
+# ПАРСИНГ ВХОДЯЩИХ ДАННЫХ
 # =========================
 
 def normalize_tax_mode(text: str) -> str:
@@ -435,6 +466,12 @@ def normalize_tax_mode(text: str) -> str:
         return "без НДС"
     if "с ндс" in t:
         return "с НДС"
+    if "самозан" in t:
+        return "самозанятый"
+    if "патент" in t:
+        return "патент"
+    if "нпд" in t:
+        return "НПД"
 
     return ""
 
@@ -448,17 +485,60 @@ def extract_phone(text: str) -> str:
         return ""
     return match.group(0).strip()
 
+def extract_inn(text: str) -> str:
+    match = re.search(r'\b\d{10,12}\b', text)
+    return match.group(0) if match else ""
+
+def extract_bik(text: str) -> str:
+    match = re.search(r'\b\d{9}\b', text)
+    return match.group(0) if match else ""
+
+def extract_rs(text: str) -> str:
+    match = re.search(r'\b\d{20}\b', text)
+    return match.group(0) if match else ""
+
+def extract_ks(text: str) -> str:
+    match = re.search(r'\b3010\d{16}\b', text)
+    return match.group(0) if match else ""
+
 def detect_customer_name(text: str) -> str:
     t = (text or "").lower()
 
     if "фрукт сервис" in t:
         return "ООО Фрукт Сервис"
     if "галанин" in t:
-        return "ИП Галанина Людмила Емельяновна"
-    if "атлант" in t:
-        return "ООО Атлант"
-    if "ип минин" in t or "минин" in t:
-        return "ИП Минин"
+        return "ИП Галанина"
+    return ""
+
+def detect_customer_code(customer_name: str) -> str:
+    t = (customer_name or "").lower()
+
+    if "галанин" in t:
+        return "GALANINA_IP"
+    return "FRUKT_SERVICE"
+
+def detect_bank_name(text: str) -> str:
+    t = text or ""
+
+    known_banks = [
+        "Сбербанк",
+        "Альфа-Банк",
+        "Т-Банк",
+        "Тинькофф",
+        "ВТБ",
+        "Россельхозбанк",
+        "Газпромбанк",
+        "Совкомбанк",
+        "Открытие"
+    ]
+
+    for bank in known_banks:
+        if bank.lower() in t.lower():
+            return bank
+
+    bank_match = re.search(r'банк[:\s\-]+([^\n,]+)', t, re.IGNORECASE)
+    if bank_match:
+        return bank_match.group(1).strip()
 
     return ""
 
@@ -481,10 +561,26 @@ def parse_bulk_reply(text: str, session: dict) -> dict:
     if tax_mode and not parsed.get("tax_mode"):
         parsed["tax_mode"] = tax_mode
 
+    bank = detect_bank_name(text)
+    if bank and not parsed.get("bank"):
+        parsed["bank"] = bank
+
+    # извлекаем все 20-значные счета
+    all_20 = re.findall(r'\b\d{20}\b', text)
+    if all_20:
+        if not parsed.get("rs"):
+            parsed["rs"] = all_20[0]
+        if len(all_20) > 1 and not parsed.get("ks"):
+            parsed["ks"] = all_20[1]
+
+    bik = extract_bik(text)
+    if bik and not parsed.get("bik"):
+        parsed["bik"] = bik
+
     return parsed
 
 def missing_session_fields(session: dict):
-    required = ["customer_name", "phone", "email", "tax_mode"]
+    required = ["customer_name", "phone", "email", "bank", "rs", "bik", "ks", "tax_mode"]
     missing = []
 
     for field in required:
@@ -498,7 +594,11 @@ def format_missing_for_user(missing: list) -> str:
         "customer_name": "заказчик",
         "phone": "телефон",
         "email": "email",
-        "tax_mode": "налогообложение (с НДС или без НДС)"
+        "bank": "банк",
+        "rs": "расчетный счет",
+        "bik": "БИК",
+        "ks": "корр. счет",
+        "tax_mode": "налогообложение (с НДС / без НДС / патент / самозанятый)"
     }
 
     lines = ["Не хватает:"]
@@ -517,12 +617,17 @@ def handle_start(message):
         "Бот запущен.\n\n"
         "Сейчас он умеет:\n"
         "— понимать задачу\n"
-        "— определять сценарий\n"
         "— подтягивать реквизиты по ИНН через DaData\n"
-        "— создавать договор через Google Script после сбора данных\n\n"
+        "— дозапрашивать недостающие данные\n"
+        "— создавать перевозчика и договор через Google Script\n\n"
         "Пример:\n"
         "Сделай договор новый перевозчик ИНН 381234567890"
     )
+
+@bot.message_handler(commands=["reset", "clear"])
+def handle_reset(message):
+    clear_session(message.chat.id)
+    bot.send_message(message.chat.id, "Сессия очищена.")
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
@@ -553,12 +658,19 @@ def handle_text(message):
             payload = {
                 "action": "create_carrier_and_contract",
                 "customer_name": session.get("customer_name", ""),
+                "customer_code": detect_customer_code(session.get("customer_name", "")),
                 "name": session.get("carrier_name", ""),
+                "form": session.get("carrier_type", ""),
                 "inn": session.get("inn", ""),
                 "ogrn": session.get("ogrn", ""),
+                "director": session.get("director", ""),
                 "address": session.get("registration_address", ""),
                 "phone": session.get("phone", ""),
                 "email": session.get("email", ""),
+                "bank": session.get("bank", ""),
+                "rs": session.get("rs", ""),
+                "bik": session.get("bik", ""),
+                "ks": session.get("ks", ""),
                 "tax_mode": session.get("tax_mode", "")
             }
 
@@ -567,12 +679,10 @@ def handle_text(message):
 
             if gs_result.get("ok"):
                 result = gs_result.get("result", {})
-                created_text = "создан" if result.get("created") else "обновлён"
-
                 bot.send_message(
                     chat_id,
                     "Готово.\n\n"
-                    f"Перевозчик {created_text} в базе.\n"
+                    f"Перевозчик создан/обновлён в базе.\n"
                     f"Договор создан.\n\n"
                     f"Номер договора: {result.get('contractNumber', '-')}\n"
                     f"Документ: {result.get('docUrl', '-')}\n"
@@ -593,22 +703,26 @@ def handle_text(message):
 
         if result.get("scenario") == "new_carrier_contract":
             known = result.get("known", {})
-            missing = result.get("missing", [])
 
-            if missing:
-                session_data = {
-                    "scenario": "new_carrier_contract",
-                    "awaiting_more_data": True,
-                    "customer_name": known.get("customer_name", ""),
-                    "carrier_name": known.get("carrier_name", ""),
-                    "inn": known.get("inn", ""),
-                    "ogrn": known.get("ogrn", ""),
-                    "registration_address": known.get("registration_address", ""),
-                    "phone": known.get("phone", ""),
-                    "email": known.get("email", ""),
-                    "tax_mode": known.get("tax_mode", "")
-                }
-                save_session(chat_id, session_data)
+            session_data = {
+                "scenario": "new_carrier_contract",
+                "awaiting_more_data": True,
+                "customer_name": known.get("customer_name", ""),
+                "carrier_name": known.get("carrier_name", ""),
+                "carrier_type": known.get("carrier_type", ""),
+                "inn": known.get("inn", ""),
+                "ogrn": known.get("ogrn", ""),
+                "registration_address": known.get("registration_address", ""),
+                "phone": known.get("phone", ""),
+                "email": known.get("email", ""),
+                "bank": known.get("bank", ""),
+                "rs": known.get("rs", ""),
+                "bik": known.get("bik", ""),
+                "ks": known.get("ks", ""),
+                "tax_mode": known.get("tax_mode", ""),
+                "director": known.get("director", "")
+            }
+            save_session(chat_id, session_data)
 
     except Exception as e:
         bot.send_message(chat_id, f"Ошибка:\n{str(e)}")
