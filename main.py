@@ -286,7 +286,14 @@ def get_company_by_inn(inn: str) -> Tuple[Dict[str, Any], str]:
         return {}, "По указанному ИНН не удалось найти компанию в DaData."
 
     company = suggestions[0].get("data", {})
-    full_name = company.get("name", {}).get("full_with_opf") or ""
+    name_data = company.get("name", {}) or {}
+    full_name = (
+        name_data.get("full_with_opf")
+        or name_data.get("full")
+        or name_data.get("short_with_opf")
+        or name_data.get("short")
+        or ""
+    )
 
     return {
         "name": full_name,
@@ -294,7 +301,7 @@ def get_company_by_inn(inn: str) -> Tuple[Dict[str, Any], str]:
         "ogrn": company.get("ogrn") or "",
         "inn": company.get("inn") or "",
         "director": "",
-        "carrier_type": detect_legal_form_from_name(full_name),
+        "carrier_type": detect_carrier_type_from_dadata(company),
     }, ""
 
 
@@ -888,12 +895,77 @@ def detect_bank_name(text: str) -> str:
 
 
 def detect_legal_form_from_name(name: str) -> str:
-    t = (name or "").lower()
-    if "ооо" in t or "общество с ограниченной ответственностью" in t:
-        return "ООО"
-    if "самозан" in t:
+    text = (name or "").upper()
+
+    if "САМОЗАН" in text:
         return "САМОЗАНЯТЫЙ"
+
+    legal_markers = [
+        "ОБЩЕСТВО",
+        "ООО",
+        "ПАО",
+        "АО",
+        "ОАО",
+        "ЗАО",
+        "АКЦИОНЕРНОЕ ОБЩЕСТВО",
+    ]
+    if any(marker in text for marker in legal_markers):
+        return "ООО"
+
+    ip_markers = ["ИП", "ИНДИВИДУАЛЬНЫЙ ПРЕДПРИНИМАТЕЛЬ"]
+    if any(marker in text for marker in ip_markers):
+        return "ИП"
+
     return "ИП"
+
+
+def detect_carrier_type_from_dadata(company: Dict[str, Any]) -> str:
+    name_data = company.get("name", {}) or {}
+    opf_data = company.get("opf", {}) or {}
+
+    full_name = (
+        name_data.get("full_with_opf")
+        or name_data.get("full")
+        or name_data.get("short_with_opf")
+        or name_data.get("short")
+        or ""
+    )
+    opf_short = opf_data.get("short") or ""
+    opf_full = opf_data.get("full") or ""
+    opf_type = opf_data.get("type") or ""
+    dadata_type = company.get("type") or ""
+
+    combined_text = " ".join([full_name, opf_short, opf_full, opf_type]).upper()
+
+    self_employed_flags = [
+        company.get("self_employed"),
+        company.get("is_self_employed"),
+        company.get("is_selfemployed"),
+    ]
+    has_self_employed_flag = any(flag is True for flag in self_employed_flags)
+
+    if has_self_employed_flag or "САМОЗАН" in combined_text:
+        carrier_type = "САМОЗАНЯТЫЙ"
+    elif "ИНДИВИДУАЛЬНЫЙ ПРЕДПРИНИМАТЕЛЬ" in combined_text or re.search(r"(^|\W)ИП(\W|$)", combined_text):
+        carrier_type = "ИП"
+    elif dadata_type == "INDIVIDUAL":
+        carrier_type = "ИП"
+    elif detect_legal_form_from_name(combined_text) == "ООО" or dadata_type == "LEGAL":
+        carrier_type = "ООО"
+    else:
+        carrier_type = detect_legal_form_from_name(full_name)
+
+    logger.info(
+        "DaData legal form detection | full_name='%s' | opf_short='%s' | opf_full='%s' | dadata_type='%s' | self_employed_flags=%s | carrier_type='%s'",
+        full_name,
+        opf_short,
+        opf_full,
+        dadata_type,
+        self_employed_flags,
+        carrier_type,
+    )
+
+    return carrier_type
 
 
 def extract_all_20_accounts(text: str) -> List[str]:
