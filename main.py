@@ -2,8 +2,46 @@ import os
 import json
 import re
 import base64
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+
 import requests
 import telebot
+from dotenv import load_dotenv
+
+# =========================
+# КОНСТАНТЫ И ЛОГИРОВАНИЕ
+# =========================
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+LOGS_DIR = BASE_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOGS_DIR / "bot.log"
+CONFIG_PATH = BASE_DIR / "config.json"
+
+logger = logging.getLogger("assistant_bot")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 # =========================
 # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
@@ -11,67 +49,254 @@ import telebot
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
+DADATA_TOKEN = os.environ.get("DADATA_TOKEN") or os.environ.get("DADATA_API_KEY")
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
+DADATA_TIMEOUT = 30
+OPENAI_ROUTER_TIMEOUT = 90
+OPENAI_VISION_TIMEOUT = 120
+GOOGLE_SCRIPT_TIMEOUT = 120
+TELEGRAM_FILE_TIMEOUT = 60
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_TOKEN")
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# =========================
+# КОНФИГ ЗАКАЗЧИКОВ
+# =========================
+
+DEFAULT_CONFIG = {
+    "customers": [
+        {
+            "name": "ООО Фрукт Сервис",
+            "code": "FRUKT_SERVICE",
+            "aliases": ["фрукт сервис", "ооо фрукт сервис", "фруктсервис"],
+        },
+        {
+            "name": "ИП Галанина",
+            "code": "GALANINA_IP",
+            "aliases": ["галанин", "галина", "ип галанина"],
+        },
+    ]
+}
+
+
+def load_config() -> Dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        logger.warning("config.json не найден, использую дефолтный конфиг")
+        return DEFAULT_CONFIG
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        if not isinstance(config, dict) or "customers" not in config:
+            logger.warning("config.json имеет неверный формат, использую дефолтный конфиг")
+            return DEFAULT_CONFIG
+
+        logger.info("Конфиг заказчиков загружен из %s", CONFIG_PATH)
+        return config
+    except Exception as e:
+        logger.exception("Ошибка чтения config.json: %s", e)
+        return DEFAULT_CONFIG
+
+
+CONFIG = load_config()
+CUSTOMERS = CONFIG.get("customers", [])
 
 # =========================
 # ПРОСТОЕ ХРАНЕНИЕ СЕССИЙ
 # =========================
 
-SESSION_STORE = {}
+SESSION_STORE: Dict[int, Dict[str, Any]] = {}
 
-def get_session(chat_id: int):
+
+def get_session(chat_id: int) -> Dict[str, Any]:
     return SESSION_STORE.get(chat_id, {})
 
-def save_session(chat_id: int, data: dict):
+
+def save_session(chat_id: int, data: Dict[str, Any]):
     SESSION_STORE[chat_id] = data
+
 
 def clear_session(chat_id: int):
     if chat_id in SESSION_STORE:
         del SESSION_STORE[chat_id]
 
+
+# =========================
+# ВАЛИДАЦИЯ
+# =========================
+
+
+def clean_digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def normalize_phone(value: str) -> str:
+    digits = clean_digits(value)
+    if len(digits) != 11 or digits[0] not in ("7", "8"):
+        return ""
+    return "+7" + digits[1:]
+
+
+def validate_phone(value: str) -> bool:
+    return bool(normalize_phone(value))
+
+
+def validate_inn(value: str) -> bool:
+    digits = clean_digits(value)
+    return len(digits) in (10, 12)
+
+
+def validate_bik(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{9}", clean_digits(value)))
+
+
+def validate_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[\w\.-]+@[\w\.-]+\.\w+", (value or "").strip()))
+
+
+def validate_account_20(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{20}", clean_digits(value)))
+
+
+def validate_session_fields(session: Dict[str, Any]) -> Dict[str, str]:
+    errors = {}
+
+    inn = session.get("inn", "")
+    if inn and not validate_inn(inn):
+        errors["inn"] = "ИНН должен содержать 10 или 12 цифр"
+
+    phone = session.get("phone", "")
+    if phone and not validate_phone(phone):
+        errors["phone"] = "Телефон должен быть в российском формате (+7XXXXXXXXXX или 8XXXXXXXXXX)"
+
+    email = session.get("email", "")
+    if email and not validate_email(email):
+        errors["email"] = "Некорректный email"
+
+    bik = session.get("bik", "")
+    if bik and not validate_bik(bik):
+        errors["bik"] = "БИК должен содержать 9 цифр"
+
+    rs = session.get("rs", "")
+    if rs and not validate_account_20(rs):
+        errors["rs"] = "Расчетный счет должен содержать 20 цифр"
+
+    ks = session.get("ks", "")
+    if ks and not validate_account_20(ks):
+        errors["ks"] = "Корреспондентский счет должен содержать 20 цифр"
+
+    return errors
+
+
+def format_validation_errors_for_user(errors: Dict[str, str]) -> str:
+    labels = {
+        "inn": "ИНН",
+        "phone": "телефон",
+        "email": "email",
+        "bik": "БИК",
+        "rs": "расчетный счет",
+        "ks": "корр. счет",
+    }
+
+    lines = ["Проверьте, пожалуйста, данные:"]
+    for field, error in errors.items():
+        lines.append(f"• {labels.get(field, field)}: {error}")
+
+    return "\n".join(lines)
+
+
+# =========================
+# HTTP-ОБВЯЗКА
+# =========================
+
+
+def post_json_with_handling(
+    url: str,
+    payload: Dict[str, Any],
+    headers: Dict[str, str],
+    timeout: int,
+    source: str,
+) -> Tuple[Dict[str, Any], str]:
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    except requests.exceptions.Timeout:
+        logger.error("%s: timeout after %s sec", source, timeout)
+        return {}, f"Сервис {source} не ответил вовремя. Попробуйте позже."
+    except requests.exceptions.RequestException as e:
+        logger.exception("%s: request error: %s", source, e)
+        return {}, f"Ошибка соединения с сервисом {source}."
+
+    if not (200 <= response.status_code < 300):
+        body_preview = (response.text or "")[:500]
+        logger.error(
+            "%s: bad status=%s body=%s",
+            source,
+            response.status_code,
+            body_preview,
+        )
+        return {}, f"Сервис {source} вернул ошибку (код {response.status_code})."
+
+    try:
+        return response.json(), ""
+    except ValueError:
+        logger.error("%s: invalid JSON response: %s", source, (response.text or "")[:500])
+        return {}, f"Сервис {source} вернул некорректный ответ."
+
+
 # =========================
 # DADATA
 # =========================
 
-def get_company_by_inn(inn: str):
+
+def get_company_by_inn(inn: str) -> Tuple[Dict[str, Any], str]:
     if not DADATA_TOKEN:
-        return None
+        logger.warning("DADATA_TOKEN не задан")
+        return {}, "Сервис DaData не настроен (нет токена)."
+
+    if not validate_inn(inn):
+        return {}, "Некорректный ИНН. ИНН должен содержать 10 или 12 цифр."
 
     url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "Authorization": f"Token {DADATA_TOKEN}"
+        "Authorization": f"Token {DADATA_TOKEN}",
     }
-    data = {"query": inn}
+    payload = {"query": clean_digits(inn)}
 
-    try:
-        response = requests.post(url, json=data, headers=headers, timeout=30)
-        if response.status_code != 200:
-            return None
+    data, error = post_json_with_handling(
+        url=url,
+        payload=payload,
+        headers=headers,
+        timeout=DADATA_TIMEOUT,
+        source="DaData",
+    )
+    if error:
+        return {}, error
 
-        result = response.json()
-        suggestions = result.get("suggestions", [])
-        if not suggestions:
-            return None
+    suggestions = data.get("suggestions", [])
+    if not suggestions:
+        return {}, "По указанному ИНН не удалось найти компанию в DaData."
 
-        company = suggestions[0]["data"]
+    company = suggestions[0].get("data", {})
+    full_name = company.get("name", {}).get("full_with_opf") or ""
 
-        return {
-            "name": company.get("name", {}).get("full_with_opf") or "",
-            "address": company.get("address", {}).get("value") or "",
-            "ogrn": company.get("ogrn") or "",
-            "inn": company.get("inn") or "",
-            "director": "",
-            "carrier_type": detect_legal_form_from_name(company.get("name", {}).get("full_with_opf") or "")
-        }
-    except Exception:
-        return None
+    return {
+        "name": full_name,
+        "address": company.get("address", {}).get("value") or "",
+        "ogrn": company.get("ogrn") or "",
+        "inn": company.get("inn") or "",
+        "director": "",
+        "carrier_type": detect_legal_form_from_name(full_name),
+    }, ""
+
 
 # =========================
 # OPENAI ROUTER
@@ -249,42 +474,79 @@ SYSTEM_PROMPT = """
 }
 """
 
-def ask_openai_router(user_text: str) -> dict:
-    url = "https://api.openai.com/v1/responses"
+
+def ask_openai_router(user_text: str) -> Tuple[Dict[str, Any], str]:
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY не задан")
+        return {}, "Сервис OpenAI не настроен (нет API-ключа)."
 
     payload = {
         "model": OPENAI_MODEL,
         "input": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}
+            {"role": "user", "content": user_text},
         ],
-        "store": False
+        "store": False,
     }
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
-    response = requests.post(url, headers=headers, json=payload, timeout=90)
-    response.raise_for_status()
-    data = response.json()
+    data, error = post_json_with_handling(
+        url="https://api.openai.com/v1/responses",
+        payload=payload,
+        headers=headers,
+        timeout=OPENAI_ROUTER_TIMEOUT,
+        source="OpenAI",
+    )
+    if error:
+        return {}, error
 
     output_text = extract_output_text(data)
-    return safe_json_loads(output_text)
+    parsed, parse_error = safe_json_loads(output_text)
+    if parse_error:
+        logger.error("OpenAI router: ошибка парсинга JSON: %s", parse_error)
+        return {}, "Сервис OpenAI вернул неожиданный формат ответа."
+
+    return parsed, ""
+
 
 # =========================
 # OPENAI VISION ДЛЯ КАРТОЧКИ
 # =========================
 
-def download_telegram_file(file_id: str) -> bytes:
-    file_info = bot.get_file(file_id)
-    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
-    response = requests.get(file_url, timeout=60)
-    response.raise_for_status()
-    return response.content
 
-def extract_card_data_from_image(image_bytes: bytes) -> dict:
+def download_telegram_file(file_id: str) -> Tuple[bytes, str]:
+    try:
+        file_info = bot.get_file(file_id)
+    except Exception as e:
+        logger.exception("Telegram get_file error: %s", e)
+        return b"", "Не удалось получить файл из Telegram."
+
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+    try:
+        response = requests.get(file_url, timeout=TELEGRAM_FILE_TIMEOUT)
+    except requests.exceptions.Timeout:
+        logger.error("Telegram file download timeout")
+        return b"", "Скачивание фото заняло слишком много времени."
+    except requests.exceptions.RequestException as e:
+        logger.exception("Telegram file download request error: %s", e)
+        return b"", "Ошибка при скачивании фото."
+
+    if not (200 <= response.status_code < 300):
+        logger.error("Telegram file download bad status=%s", response.status_code)
+        return b"", f"Telegram вернул ошибку при скачивании фото (код {response.status_code})."
+
+    return response.content, ""
+
+
+def extract_card_data_from_image(image_bytes: bytes) -> Tuple[Dict[str, Any], str]:
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY не задан")
+        return {}, "Сервис OpenAI не настроен (нет API-ключа)."
+
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
     prompt = """
@@ -328,41 +590,55 @@ def extract_card_data_from_image(image_bytes: bytes) -> dict:
                     {
                         "type": "input_image",
                         "image_url": f"data:image/jpeg;base64,{base64_image}",
-                        "detail": "high"
-                    }
-                ]
+                        "detail": "high",
+                    },
+                ],
             }
         ],
-        "store": False
+        "store": False,
     }
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
-    response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=120)
-    response.raise_for_status()
-    data = response.json()
+    data, error = post_json_with_handling(
+        url="https://api.openai.com/v1/responses",
+        payload=payload,
+        headers=headers,
+        timeout=OPENAI_VISION_TIMEOUT,
+        source="OpenAI Vision",
+    )
+    if error:
+        return {}, error
 
     output_text = extract_output_text(data)
-    return safe_json_loads(output_text)
+    parsed, parse_error = safe_json_loads(output_text)
+    if parse_error:
+        logger.error("OpenAI vision: ошибка парсинга JSON: %s", parse_error)
+        return {}, "Не удалось корректно распознать карточку. Попробуйте более четкое фото."
+
+    return parsed, ""
+
 
 # =========================
 # ОБОГАЩЕНИЕ РЕЗУЛЬТАТА DADATA
 # =========================
 
-def enrich_result_with_dadata(result: dict) -> dict:
+
+def enrich_result_with_dadata(result: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     known = result.get("known", {}) or {}
     missing = result.get("missing", []) or []
 
     inn = known.get("inn")
     if not inn:
-        return result
+        return result, ""
 
-    company = get_company_by_inn(inn)
-    if not company:
-        return result
+    company, error = get_company_by_inn(inn)
+    if error:
+        logger.info("DaData enrichment skipped: %s", error)
+        return result, error
 
     if company.get("name") and not known.get("carrier_name"):
         known["carrier_name"] = company["name"]
@@ -395,29 +671,42 @@ def enrich_result_with_dadata(result: dict) -> dict:
             "заказчик, телефон, email, банк, расчетный счет, БИК, корр. счет, налогообложение."
         )
 
-    return result
+    return result, ""
+
 
 # =========================
 # GOOGLE SCRIPT
 # =========================
 
-def call_google_script(payload: dict):
-    if not GOOGLE_SCRIPT_URL:
-        raise RuntimeError("Не задан GOOGLE_SCRIPT_URL")
 
-    response = requests.post(
-        GOOGLE_SCRIPT_URL,
-        json=payload,
-        timeout=120
+def call_google_script(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    if not GOOGLE_SCRIPT_URL:
+        logger.warning("GOOGLE_SCRIPT_URL не задан")
+        return {}, "Не настроена интеграция с Google Script (нет URL)."
+
+    data, error = post_json_with_handling(
+        url=GOOGLE_SCRIPT_URL,
+        payload=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=GOOGLE_SCRIPT_TIMEOUT,
+        source="Google Script",
     )
-    response.raise_for_status()
-    return response.json()
+    if error:
+        return {}, error
+
+    if not isinstance(data, dict):
+        logger.error("Google Script: response is not dict")
+        return {}, "Google Script вернул неожиданный формат ответа."
+
+    return data, ""
+
 
 # =========================
 # ФОРМАТ ОТВЕТА
 # =========================
 
-def format_router_result(result: dict) -> str:
+
+def format_router_result(result: Dict[str, Any]) -> str:
     scenario = result.get("scenario", "unknown")
     role = result.get("role", "unknown")
     known = result.get("known", {})
@@ -432,14 +721,14 @@ def format_router_result(result: dict) -> str:
         "driver_issue": "Замечание по машине",
         "driver_expense": "Расход водителя / машины",
         "logistics_report": "Отчёт по логистике",
-        "unknown": "Не определено"
+        "unknown": "Не определено",
     }
 
     role_labels = {
         "manager": "Менеджер",
         "driver": "Водитель",
         "owner": "Руководитель",
-        "unknown": "Не определено"
+        "unknown": "Не определено",
     }
 
     field_labels = {
@@ -472,7 +761,7 @@ def format_router_result(result: dict) -> str:
         "expense_type": "тип расхода",
         "expense_amount": "сумма расхода",
         "fuel_amount": "сумма топлива",
-        "fuel_liters": "литры топлива"
+        "fuel_liters": "литры топлива",
     }
 
     lines = []
@@ -500,9 +789,11 @@ def format_router_result(result: dict) -> str:
 
     return "\n".join(lines)
 
+
 # =========================
 # ПАРСИНГ ВХОДЯЩИХ ДАННЫХ
 # =========================
+
 
 def normalize_tax_mode(text: str) -> str:
     t = (text or "").lower()
@@ -520,34 +811,55 @@ def normalize_tax_mode(text: str) -> str:
 
     return ""
 
+
 def extract_email(text: str) -> str:
-    match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
-    return match.group(0) if match else ""
+    match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text or "")
+    value = match.group(0) if match else ""
+    return value if not value or validate_email(value) else ""
+
 
 def extract_phone(text: str) -> str:
-    match = re.search(r'(\+7|8)[\d\-\s\(\)]{9,}', text)
+    match = re.search(r"(\+7|8)[\d\-\s\(\)]{9,}", text or "")
     if not match:
         return ""
-    return match.group(0).strip()
+    return normalize_phone(match.group(0).strip())
+
 
 def extract_bik(text: str) -> str:
-    match = re.search(r'\b\d{9}\b', text)
-    return match.group(0) if match else ""
+    match = re.search(r"\b\d{9}\b", text or "")
+    if not match:
+        return ""
+    bik = match.group(0)
+    return bik if validate_bik(bik) else ""
+
 
 def detect_customer_name(text: str) -> str:
     t = (text or "").lower()
+    for customer in CUSTOMERS:
+        aliases = customer.get("aliases", []) or []
+        name = customer.get("name", "")
+        normalized_aliases = [a.lower() for a in aliases]
 
-    if "фрукт сервис" in t:
-        return "ООО Фрукт Сервис"
-    if "галанин" in t:
-        return "ИП Галанина"
+        if name and name.lower() in t:
+            return name
+
+        for alias in normalized_aliases:
+            if alias and alias in t:
+                return name
+
     return ""
+
 
 def detect_customer_code(customer_name: str) -> str:
     t = (customer_name or "").lower()
-    if "галанин" in t:
-        return "GALANINA_IP"
+    for customer in CUSTOMERS:
+        name = (customer.get("name") or "").lower()
+        if name and name == t:
+            return customer.get("code", "FRUKT_SERVICE")
+
+    # fallback в случае отсутствия явного совпадения
     return "FRUKT_SERVICE"
+
 
 def detect_bank_name(text: str) -> str:
     t = text or ""
@@ -561,18 +873,19 @@ def detect_bank_name(text: str) -> str:
         "Россельхозбанк",
         "Газпромбанк",
         "Совкомбанк",
-        "Открытие"
+        "Открытие",
     ]
 
     for bank in known_banks:
         if bank.lower() in t.lower():
             return bank
 
-    bank_match = re.search(r'банк[:\s\-]+([^\n,]+)', t, re.IGNORECASE)
+    bank_match = re.search(r"банк[:\s\-]+([^\n,]+)", t, re.IGNORECASE)
     if bank_match:
         return bank_match.group(1).strip()
 
     return ""
+
 
 def detect_legal_form_from_name(name: str) -> str:
     t = (name or "").lower()
@@ -582,10 +895,13 @@ def detect_legal_form_from_name(name: str) -> str:
         return "САМОЗАНЯТЫЙ"
     return "ИП"
 
-def extract_all_20_accounts(text: str):
-    return re.findall(r'\b\d{20}\b', text or "")
 
-def parse_bulk_reply(text: str, session: dict) -> dict:
+def extract_all_20_accounts(text: str) -> List[str]:
+    accounts = re.findall(r"\b\d{20}\b", text or "")
+    return [acc for acc in accounts if validate_account_20(acc)]
+
+
+def parse_bulk_reply(text: str, session: Dict[str, Any]) -> Dict[str, Any]:
     parsed = dict(session)
 
     customer_name = detect_customer_name(text)
@@ -621,7 +937,8 @@ def parse_bulk_reply(text: str, session: dict) -> dict:
 
     return parsed
 
-def missing_session_fields(session: dict):
+
+def missing_session_fields(session: Dict[str, Any]) -> List[str]:
     required = ["customer_name", "phone", "email", "bank", "rs", "bik", "ks", "tax_mode"]
     missing = []
 
@@ -631,7 +948,8 @@ def missing_session_fields(session: dict):
 
     return missing
 
-def format_missing_for_user(missing: list) -> str:
+
+def format_missing_for_user(missing: List[str]) -> str:
     labels = {
         "customer_name": "заказчик",
         "phone": "телефон",
@@ -640,7 +958,7 @@ def format_missing_for_user(missing: list) -> str:
         "rs": "расчетный счет",
         "bik": "БИК",
         "ks": "корр. счет",
-        "tax_mode": "налогообложение (с НДС / без НДС / патент / самозанятый)"
+        "tax_mode": "налогообложение (с НДС / без НДС / патент / самозанятый)",
     }
 
     lines = ["Не хватает:"]
@@ -648,11 +966,13 @@ def format_missing_for_user(missing: list) -> str:
         lines.append(f"• {labels.get(item, item)}")
     return "\n".join(lines)
 
+
 # =========================
 # СЛУЖЕБНЫЕ
 # =========================
 
-def extract_output_text(data: dict) -> str:
+
+def extract_output_text(data: Dict[str, Any]) -> str:
     output_text = ""
 
     if "output_text" in data and data["output_text"]:
@@ -667,16 +987,29 @@ def extract_output_text(data: dict) -> str:
 
     return output_text.strip()
 
-def safe_json_loads(output_text: str) -> dict:
-    if output_text.startswith("```"):
-        output_text = output_text.strip("`")
-        output_text = output_text.replace("json", "", 1).strip()
 
-    return json.loads(output_text)
+def safe_json_loads(output_text: str) -> Tuple[Dict[str, Any], str]:
+    raw = (output_text or "").strip()
+
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw.replace("json", "", 1).strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return {}, str(e)
+
+    if not isinstance(data, dict):
+        return {}, "JSON не является объектом"
+
+    return data, ""
+
 
 # =========================
 # TELEGRAM
 # =========================
+
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
@@ -691,13 +1024,15 @@ def handle_start(message):
         "— создавать перевозчика и договор через Google Script\n\n"
         "Примеры:\n"
         "1) Сделай договор новый перевозчик ИНН 381250673578\n"
-        "2) Отправь фото карточки предприятия"
+        "2) Отправь фото карточки предприятия",
     )
+
 
 @bot.message_handler(commands=["reset", "clear"])
 def handle_reset(message):
     clear_session(message.chat.id)
     bot.send_message(message.chat.id, "Сессия очищена.")
+
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
@@ -709,24 +1044,33 @@ def handle_photo(message):
 
         bot.send_message(chat_id, "Получил фото. Считываю реквизиты с карточки...")
 
-        image_bytes = download_telegram_file(file_id)
-        extracted = extract_card_data_from_image(image_bytes)
+        image_bytes, download_error = download_telegram_file(file_id)
+        if download_error:
+            bot.send_message(chat_id, f"Не удалось обработать фото: {download_error}")
+            return
+
+        extracted, extract_error = extract_card_data_from_image(image_bytes)
+        if extract_error:
+            bot.send_message(chat_id, f"Ошибка распознавания карточки: {extract_error}")
+            return
 
         session = get_session(chat_id)
         session["scenario"] = "new_carrier_contract"
         session["awaiting_more_data"] = True
 
         session["carrier_name"] = extracted.get("carrier_name", "")
-        session["carrier_type"] = extracted.get("carrier_type", "") or detect_legal_form_from_name(extracted.get("carrier_name", ""))
-        session["inn"] = extracted.get("inn", "")
+        session["carrier_type"] = extracted.get("carrier_type", "") or detect_legal_form_from_name(
+            extracted.get("carrier_name", "")
+        )
+        session["inn"] = clean_digits(extracted.get("inn", ""))
         session["ogrn"] = extracted.get("ogrn", "")
         session["registration_address"] = extracted.get("registration_address", "")
-        session["phone"] = extracted.get("phone", "")
+        session["phone"] = normalize_phone(extracted.get("phone", ""))
         session["email"] = extracted.get("email", "")
         session["bank"] = extracted.get("bank", "")
-        session["rs"] = extracted.get("rs", "")
-        session["ks"] = extracted.get("ks", "")
-        session["bik"] = extracted.get("bik", "")
+        session["rs"] = clean_digits(extracted.get("rs", ""))
+        session["ks"] = clean_digits(extracted.get("ks", ""))
+        session["bik"] = clean_digits(extracted.get("bik", ""))
         session["director"] = extracted.get("director", "")
         session["customer_name"] = session.get("customer_name", "")
         session["tax_mode"] = session.get("tax_mode", "")
@@ -751,8 +1095,12 @@ def handle_photo(message):
             if value:
                 lines.append(f"• {label}: {value}")
 
-        missing = missing_session_fields(session)
+        validation_errors = validate_session_fields(session)
+        if validation_errors:
+            lines.append("")
+            lines.append(format_validation_errors_for_user(validation_errors))
 
+        missing = missing_session_fields(session)
         if missing:
             lines.append("")
             lines.append(format_missing_for_user(missing))
@@ -760,17 +1108,22 @@ def handle_photo(message):
             lines.append("Пришлите недостающие данные одним сообщением.")
         else:
             lines.append("")
-            lines.append("Данных достаточно для создания. Если нужно, отправьте заказчика отдельным сообщением.")
+            lines.append("Данных достаточно для создания договора.")
 
         bot.send_message(chat_id, "\n".join(lines))
 
     except Exception as e:
-        bot.send_message(chat_id, f"Ошибка при чтении карточки:\n{str(e)}")
+        logger.exception("Ошибка в handle_photo: %s", e)
+        bot.send_message(
+            chat_id,
+            "Не удалось обработать фото из-за внутренней ошибки. Попробуйте ещё раз через минуту.",
+        )
+
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     chat_id = message.chat.id
-    user_text = message.text.strip()
+    user_text = (message.text or "").strip()
 
     if not user_text:
         bot.send_message(chat_id, "Пустое сообщение.")
@@ -782,15 +1135,33 @@ def handle_text(message):
         # Если уже ждём доп.данные по новому перевозчику
         if session.get("scenario") == "new_carrier_contract" and session.get("awaiting_more_data"):
             session = parse_bulk_reply(user_text, session)
+
+            # Дочищаем и нормализуем поля
+            if session.get("inn"):
+                session["inn"] = clean_digits(session.get("inn", ""))
+            if session.get("bik"):
+                session["bik"] = clean_digits(session.get("bik", ""))
+            if session.get("rs"):
+                session["rs"] = clean_digits(session.get("rs", ""))
+            if session.get("ks"):
+                session["ks"] = clean_digits(session.get("ks", ""))
+            if session.get("phone"):
+                session["phone"] = normalize_phone(session.get("phone", ""))
+
             save_session(chat_id, session)
 
             still_missing = missing_session_fields(session)
-            if still_missing:
-                bot.send_message(
-                    chat_id,
-                    format_missing_for_user(still_missing) +
-                    "\n\nПришлите недостающие данные одним сообщением."
-                )
+            validation_errors = validate_session_fields(session)
+
+            if still_missing or validation_errors:
+                messages = []
+                if validation_errors:
+                    messages.append(format_validation_errors_for_user(validation_errors))
+                if still_missing:
+                    messages.append(format_missing_for_user(still_missing))
+                messages.append("\nПришлите корректные/недостающие данные одним сообщением.")
+
+                bot.send_message(chat_id, "\n\n".join(messages))
                 return
 
             payload = {
@@ -809,10 +1180,18 @@ def handle_text(message):
                 "rs": session.get("rs", ""),
                 "bik": session.get("bik", ""),
                 "ks": session.get("ks", ""),
-                "tax_mode": session.get("tax_mode", "")
+                "tax_mode": session.get("tax_mode", ""),
             }
 
-            gs_result = call_google_script(payload)
+            gs_result, gs_error = call_google_script(payload)
+            if gs_error:
+                bot.send_message(
+                    chat_id,
+                    f"Не удалось создать договор: {gs_error}\n"
+                    "Проверьте данные и попробуйте ещё раз позже.",
+                )
+                return
+
             clear_session(chat_id)
 
             if gs_result.get("ok"):
@@ -820,23 +1199,42 @@ def handle_text(message):
                 bot.send_message(
                     chat_id,
                     "Готово.\n\n"
-                    f"Перевозчик создан/обновлён в базе.\n"
-                    f"Договор создан.\n\n"
+                    "Перевозчик создан/обновлён в базе.\n"
+                    "Договор создан.\n\n"
                     f"Номер договора: {result.get('contractNumber', '-')}\n"
                     f"Документ: {result.get('docUrl', '-')}\n"
-                    f"PDF: {result.get('pdfUrl', '-')}"
+                    f"PDF: {result.get('pdfUrl', '-')}",
                 )
             else:
                 bot.send_message(
                     chat_id,
-                    f"Ошибка Google Script:\n{gs_result.get('error', 'Неизвестная ошибка')}"
+                    f"Google Script вернул ошибку: {gs_result.get('error', 'Неизвестная ошибка')}",
                 )
             return
 
         # Новый запрос
-        result = ask_openai_router(user_text)
-        result = enrich_result_with_dadata(result)
+        result, openai_error = ask_openai_router(user_text)
+        if openai_error:
+            bot.send_message(chat_id, f"Не удалось обработать запрос: {openai_error}")
+            return
+
+        # Локальная валидация ИНН из роутера
+        known = result.get("known", {}) or {}
+        if known.get("inn"):
+            known["inn"] = clean_digits(known["inn"])
+            if not validate_inn(known["inn"]):
+                bot.send_message(chat_id, "ИНН должен содержать 10 или 12 цифр. Уточните ИНН.")
+                return
+
+        result["known"] = known
+
+        result, dadata_error = enrich_result_with_dadata(result)
         reply = format_router_result(result)
+
+        # Не ломаем сценарий из-за DaData, просто предупреждаем
+        if dadata_error:
+            reply += "\n\n⚠️ Подсказка: автопоиск по DaData сейчас недоступен, можно продолжить вручную."
+
         bot.send_message(chat_id, reply)
 
         if result.get("scenario") == "new_carrier_contract":
@@ -848,22 +1246,37 @@ def handle_text(message):
                 "customer_name": known.get("customer_name", ""),
                 "carrier_name": known.get("carrier_name", ""),
                 "carrier_type": known.get("carrier_type", ""),
-                "inn": known.get("inn", ""),
+                "inn": clean_digits(known.get("inn", "")),
                 "ogrn": known.get("ogrn", ""),
                 "registration_address": known.get("registration_address", ""),
-                "phone": known.get("phone", ""),
+                "phone": normalize_phone(known.get("phone", "")),
                 "email": known.get("email", ""),
                 "bank": known.get("bank", ""),
-                "rs": known.get("rs", ""),
-                "bik": known.get("bik", ""),
-                "ks": known.get("ks", ""),
+                "rs": clean_digits(known.get("rs", "")),
+                "bik": clean_digits(known.get("bik", "")),
+                "ks": clean_digits(known.get("ks", "")),
                 "tax_mode": known.get("tax_mode", ""),
-                "director": known.get("director", "")
+                "director": known.get("director", ""),
             }
+
+            validation_errors = validate_session_fields(session_data)
+            if validation_errors:
+                bot.send_message(chat_id, format_validation_errors_for_user(validation_errors))
+
             save_session(chat_id, session_data)
 
     except Exception as e:
-        bot.send_message(chat_id, f"Ошибка:\n{str(e)}")
+        logger.exception("Ошибка в handle_text: %s", e)
+        bot.send_message(
+            chat_id,
+            "Произошла внутренняя ошибка при обработке сообщения. Попробуйте снова через минуту.",
+        )
+
 
 if __name__ == "__main__":
-    bot.infinity_polling(skip_pending=True)
+    logger.info("Бот запущен")
+    try:
+        bot.infinity_polling(skip_pending=True)
+    except Exception as e:
+        logger.exception("Критическая ошибка polling: %s", e)
+        raise
