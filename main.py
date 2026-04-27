@@ -6,6 +6,10 @@ import zipfile
 import base64
 import logging
 import time
+import tempfile
+import subprocess
+import shutil
+from urllib.parse import urlencode
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
@@ -14,6 +18,16 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
+
+try:
+    import openai
+except Exception:  # pragma: no cover
+    openai = None
+
+try:
+    from pydub import AudioSegment
+except Exception:  # pragma: no cover
+    AudioSegment = None
 
 try:
     from pypdf import PdfReader
@@ -62,6 +76,9 @@ DADATA_TOKEN = os.environ.get("DADATA_TOKEN") or os.environ.get("DADATA_API_KEY"
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+if openai and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
 DADATA_TIMEOUT = 30
 OPENAI_ROUTER_TIMEOUT = 90
@@ -1348,6 +1365,361 @@ def format_missing_for_user(missing: List[str]) -> str:
     return "\n".join(lines)
 
 
+def extract_number(text: str) -> int:
+    text = (text or "").lower()
+    match = re.search(r"\d+", text)
+    if match:
+        return int(match.group(0))
+
+    words_map = {
+        "один": 1,
+        "два": 2,
+        "три": 3,
+        "четыре": 4,
+        "пять": 5,
+        "шесть": 6,
+        "семь": 7,
+        "восемь": 8,
+        "девять": 9,
+        "десять": 10,
+        "одиннадцать": 11,
+        "двенадцать": 12,
+        "тринадцать": 13,
+        "четырнадцать": 14,
+        "пятнадцать": 15,
+        "шестнадцать": 16,
+        "семнадцать": 17,
+        "восемнадцать": 18,
+        "девятнадцать": 19,
+        "двадцать": 20,
+    }
+    for word, value in words_map.items():
+        if word in text:
+            return value
+
+    return 0
+
+
+def convert_ogg_to_mp3(voice_path: str) -> Tuple[str, str]:
+    mp3_path = f"{voice_path}.mp3"
+
+    if AudioSegment is not None:
+        try:
+            AudioSegment.from_file(voice_path, format="ogg").export(mp3_path, format="mp3")
+            return mp3_path, ""
+        except Exception as e:
+            logger.warning("pydub conversion failed, fallback to ffmpeg: %s", e)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        return "", "Не найден ffmpeg для конвертации голосового сообщения."
+
+    try:
+        proc = subprocess.run(
+            [ffmpeg_path, "-y", "-i", voice_path, mp3_path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            logger.error("ffmpeg conversion failed: %s", (proc.stderr or "")[:500])
+            return "", "Не удалось конвертировать голосовое сообщение в MP3."
+        return mp3_path, ""
+    except Exception as e:
+        logger.exception("ffmpeg conversion exception: %s", e)
+        return "", "Ошибка конвертации голосового сообщения."
+
+
+def transcribe_audio_with_whisper(mp3_path: str) -> Tuple[str, str]:
+    if not OPENAI_API_KEY:
+        return "", "OPENAI_API_KEY не задан, распознавание голоса недоступно."
+
+    if openai is None:
+        return "", "Библиотека openai не установлена на сервере."
+
+    try:
+        with open(mp3_path, "rb") as audio:
+            transcript = openai.Audio.transcribe("whisper-1", audio)
+            text = (transcript or {}).get("text", "").strip()
+            if not text:
+                return "", "Whisper не вернул текст распознавания."
+            return text, ""
+    except Exception as e:
+        logger.exception("Whisper transcription error: %s", e)
+        return "", "Ошибка распознавания голосового сообщения через Whisper."
+
+
+def build_google_form_url(page: str, **params: Any) -> str:
+    base_url = os.getenv("GOOGLE_SCRIPT_URL") or ""
+    if not base_url:
+        return ""
+
+    query = {"page": page}
+    for key, value in params.items():
+        if value is not None and str(value).strip() != "":
+            query[key] = str(value)
+
+    return f"{base_url}?{urlencode(query)}"
+
+
+def parse_route_command(message, text: str):
+    chat_id = message.chat.id
+
+    result, openai_error = ask_openai_router(text)
+    if openai_error:
+        bot.send_message(chat_id, f"Не удалось разобрать команду рейса: {openai_error}")
+        return
+
+    known = result.get("known", {}) or {}
+    session = get_session(chat_id)
+    session["scenario"] = "existing_carrier_trip_request"
+    session["route_from"] = known.get("route_from", session.get("route_from", ""))
+    session["route_to"] = known.get("route_to", session.get("route_to", ""))
+    session["route_name"] = known.get("route_name", session.get("route_name", ""))
+    session["carrier_name"] = known.get("carrier_name", session.get("carrier_name", ""))
+    session["price"] = known.get("price", session.get("price", ""))
+
+    pallets = known.get("pallets") or extract_number(text)
+    if pallets:
+        session["pallets"] = pallets
+
+    save_session(chat_id, session)
+
+    if not session.get("pallets"):
+        bot.send_message(chat_id, "Уточните количество паллет, чтобы подобрать перевозчика.")
+        return
+
+    find_suitable_carriers(message, int(session.get("pallets") or 0))
+
+
+def find_suitable_carriers(message, pallets: int):
+    """Подобрать перевозчиков по вместимости."""
+    chat_id = message.chat.id
+
+    if pallets <= 0:
+        bot.send_message(chat_id, "Укажите количество паллет числом, например: 10 паллет.")
+        return
+
+    payload = {
+        "action": "get_available_carriers",
+        "pallets": pallets,
+    }
+    data, error = call_google_script(payload)
+    if error:
+        bot.send_message(chat_id, f"❌ Ошибка подбора перевозчиков: {error}")
+        return
+
+    if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), dict):
+        data = data.get("result", {})
+
+    if not data.get("success"):
+        bot.send_message(chat_id, "❌ Ошибка подбора перевозчиков")
+        return
+
+    carriers = data.get("carriers", []) or []
+    if not carriers:
+        bot.send_message(chat_id, f"❌ Нет перевозчиков с машинами на {pallets} паллет")
+        return
+
+    session = get_session(chat_id)
+    session["scenario"] = "existing_carrier_trip_request"
+    session["pallets"] = pallets
+    session["auto_carriers_map"] = {str(c.get("id")): c for c in carriers}
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    for carrier in carriers[:5]:
+        priority_emoji = {
+            1: "🟢",
+            2: "🟡",
+            3: "🟠",
+            4: "🔴",
+        }.get(carrier.get("priority"), "⚪")
+
+        btn_text = f"{priority_emoji} {carrier.get('name', 'Без названия')} ({carrier.get('tax_mode', '—')})"
+        markup.add(
+            InlineKeyboardButton(
+                text=btn_text,
+                callback_data=f"select_carrier_auto_{carrier.get('id')}",
+            )
+        )
+
+    bot.send_message(
+        chat_id,
+        f"🚚 Подобраны перевозчики для {pallets} паллет:\n\n"
+        f"🟢 С НДС (приоритет)\n"
+        f"🟡 Без НДС\n"
+        f"🟠 Самозанятый\n"
+        f"🔴 Наличный расчёт",
+        reply_markup=markup,
+    )
+
+
+def show_vehicle_add_options(message):
+    """Меню добавления машины."""
+    markup = InlineKeyboardMarkup()
+    vehicle_form_url = build_google_form_url("vehicle")
+    if vehicle_form_url:
+        markup.add(InlineKeyboardButton("📝 Заполнить Google Форму", url=vehicle_form_url))
+
+    markup.add(
+        InlineKeyboardButton(
+            "⌨️ Ввести данные вручную",
+            callback_data="vehicle_manual_entry",
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "🚚 Как добавить машину?\n\n"
+        "Форма автоматически привяжет машину к перевозчику.",
+        reply_markup=markup,
+    )
+
+
+def show_carrier_vehicles(message, carrier_id, carrier_name):
+    """Показать машины перевозчика."""
+    chat_id = message.chat.id
+    data, error = call_google_script({"action": "get_vehicles", "carrier_id": carrier_id})
+    if error:
+        bot.send_message(chat_id, f"❌ Ошибка получения машин: {error}")
+        return
+
+    if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), dict):
+        data = data.get("result", {})
+
+    vehicles = data.get("vehicles", []) or []
+
+    session = get_session(chat_id)
+    session["selected_carrier_id"] = carrier_id
+    session["selected_carrier_name"] = carrier_name
+
+    if not vehicles:
+        vehicle_form_url = build_google_form_url("vehicle", carrier_id=carrier_id)
+        markup = InlineKeyboardMarkup()
+        if vehicle_form_url:
+            markup.add(InlineKeyboardButton("➕ Добавить машину", url=vehicle_form_url))
+        save_session(chat_id, session)
+        bot.send_message(
+            chat_id,
+            f"❌ У перевозчика {carrier_name} нет машин в базе",
+            reply_markup=markup if vehicle_form_url else None,
+        )
+        return
+
+    session["vehicles_map"] = {str(v.get("id")): v for v in vehicles}
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    for v in vehicles:
+        btn_text = (
+            f"🚛 {v.get('brand', '')} {v.get('model', '')} {v.get('number', '')} | "
+            f"{v.get('capacity_pallets', '?')}п | {v.get('capacity_tons', '?')}т | {v.get('temp_regime', '—')}"
+        )
+        markup.add(
+            InlineKeyboardButton(
+                text=btn_text,
+                callback_data=f"select_vehicle_{v.get('id')}",
+            )
+        )
+
+    vehicle_form_url = build_google_form_url("vehicle", carrier_id=carrier_id)
+    if vehicle_form_url:
+        markup.add(InlineKeyboardButton("➕ Добавить новую машину", url=vehicle_form_url))
+
+    bot.send_message(chat_id, f"Выберите машину ({carrier_name}):", reply_markup=markup)
+
+
+def show_carrier_drivers(message, carrier_id, vehicle_id):
+    """Показать водителей перевозчика."""
+    chat_id = message.chat.id
+    data, error = call_google_script({"action": "get_drivers", "carrier_id": carrier_id})
+    if error:
+        bot.send_message(chat_id, f"❌ Ошибка получения водителей: {error}")
+        return
+
+    if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), dict):
+        data = data.get("result", {})
+
+    drivers = data.get("drivers", []) or []
+
+    session = get_session(chat_id)
+    session["selected_vehicle_id"] = vehicle_id
+
+    if not drivers:
+        driver_form_url = build_google_form_url("driver", carrier_id=carrier_id)
+        markup = InlineKeyboardMarkup()
+        if driver_form_url:
+            markup.add(InlineKeyboardButton("➕ Добавить водителя", url=driver_form_url))
+        save_session(chat_id, session)
+        bot.send_message(chat_id, "❌ Нет водителей в базе", reply_markup=markup if driver_form_url else None)
+        return
+
+    session["drivers_map"] = {str(d.get("id")): d for d in drivers}
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    for d in drivers:
+        medbook_status = "✅" if d.get("medbook_valid") else "⚠️"
+        medbook_until = d.get("medbook_valid_until") or "—"
+        btn_text = f"{medbook_status} {d.get('full_name', 'Без имени')} | Мед до {medbook_until}"
+        markup.add(
+            InlineKeyboardButton(
+                text=btn_text,
+                callback_data=f"select_driver_{d.get('id')}_{vehicle_id}",
+            )
+        )
+
+    driver_form_url = build_google_form_url("driver", carrier_id=carrier_id)
+    if driver_form_url:
+        markup.add(InlineKeyboardButton("➕ Добавить водителя", url=driver_form_url))
+
+    bot.send_message(chat_id, "Выберите водителя:", reply_markup=markup)
+
+
+def handle_voice_command(message, text: str):
+    text_lower = (text or "").lower()
+
+    if "новый перевозчик" in text_lower or "добавить перевозчик" in text_lower:
+        show_carrier_add_options(message)
+        return
+
+    if "новая машина" in text_lower or "добавить машину" in text_lower:
+        show_vehicle_add_options(message)
+        return
+
+    if "нужна машина" in text_lower or "нужен транспорт" in text_lower:
+        pallets = extract_number(text)
+        find_suitable_carriers(message, pallets)
+        return
+
+    if "рейс" in text_lower:
+        parse_route_command(message, text)
+        return
+
+    message.text = text
+    handle_text(message)
+
+
+def route_quick_commands(message, text: str) -> bool:
+    text_lower = (text or "").lower()
+
+    if "новая машина" in text_lower or "добавить машину" in text_lower:
+        show_vehicle_add_options(message)
+        return True
+
+    if "нужна машина" in text_lower or "нужен транспорт" in text_lower:
+        pallets = extract_number(text)
+        find_suitable_carriers(message, pallets)
+        return True
+
+    if "рейс" in text_lower:
+        parse_route_command(message, text)
+        return True
+
+    return False
+
+
 # =========================
 # СЛУЖЕБНЫЕ
 # =========================
@@ -1408,18 +1780,39 @@ def build_add_carrier_markup() -> InlineKeyboardMarkup:
             callback_data="carrier_upload_card",
         )
     )
-    markup.add(
-        InlineKeyboardButton(
-            text="📝 Заполнить Google Форму",
-            url="https://script.google.com/macros/s/AKfycbwQkC2kc8V9oD1fn7Ug8cLUGqnw8S0ZuCFIkBgRZcr1V3dNeFRV-JFAPOt45DBP5p-z/exec?page=carrier",
+
+    carrier_form_url = build_google_form_url("carrier")
+    if carrier_form_url:
+        markup.add(
+            InlineKeyboardButton(
+                text="📝 Заполнить Google Форму",
+                url=carrier_form_url,
+            )
         )
-    )
+
     markup.add(
         InlineKeyboardButton(
             text="⌨️ Ввести ИНН (автозаполнение DaData)",
             callback_data="carrier_enter_inn",
         )
     )
+    return markup
+
+
+def build_dadata_followup_markup(inn: str) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+
+    carrier_form_url = build_google_form_url("carrier", inn=inn)
+    if carrier_form_url:
+        markup.add(
+            InlineKeyboardButton(
+                "📝 Дозаполнить в Google Форме",
+                url=carrier_form_url,
+            )
+        )
+
+    markup.add(InlineKeyboardButton("✏️ Ввести вручную", callback_data="carrier_manual_complete"))
+    markup.add(InlineKeyboardButton("⏩ Продолжить без реквизитов", callback_data="carrier_skip_details"))
     return markup
 
 
@@ -1679,6 +2072,156 @@ def handle_carrier_card_upload(call):
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "vehicle_manual_entry")
+def handle_vehicle_manual_entry(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["awaiting_vehicle_manual_entry"] = True
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "✏️ Введите данные машины одним сообщением в формате:\n"
+        "Перевозчик: <название или ID>\n"
+        "Марка: ...\nМодель: ...\nГосномер: ...\n"
+        "Паллет: ...\nТонн: ...\nТемп режим: ...\n\n"
+        "Или используйте Google Форму для быстрого добавления.",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "carrier_manual_complete")
+def handle_carrier_manual_complete(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["awaiting_more_data"] = True
+    session["carrier_details_skipped"] = False
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "Введите недостающие реквизиты одним сообщением (телефон, email, банк, р/с, БИК, к/с, налогообложение).",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "carrier_skip_details")
+def handle_carrier_skip_details(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["carrier_details_skipped"] = True
+    session["awaiting_more_data"] = False
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "✅ Принято. Продолжаем без реквизитов.\n"
+        "Теперь можно перейти к заявке на рейс (например: 'Нужна машина 10 паллет').",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("select_carrier_auto_"))
+def handle_select_auto_carrier(call):
+    chat_id = call.message.chat.id
+    carrier_id = call.data.replace("select_carrier_auto_", "", 1)
+
+    session = get_session(chat_id)
+    carriers_map = session.get("auto_carriers_map", {}) or {}
+    carrier = carriers_map.get(str(carrier_id), {})
+
+    carrier_name = carrier.get("name", f"ID {carrier_id}")
+    session["selected_carrier_id"] = carrier_id
+    session["selected_carrier_name"] = carrier_name
+    session["selected_carrier_tax_mode"] = carrier.get("tax_mode", "")
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, f"Выбран перевозчик: {carrier_name}")
+    show_carrier_vehicles(call.message, carrier_id, carrier_name)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("select_vehicle_"))
+def handle_select_vehicle(call):
+    chat_id = call.message.chat.id
+    vehicle_id = call.data.replace("select_vehicle_", "", 1)
+
+    session = get_session(chat_id)
+    carrier_id = session.get("selected_carrier_id")
+    if not carrier_id:
+        bot.answer_callback_query(call.id, "Сначала выберите перевозчика")
+        return
+
+    vehicles_map = session.get("vehicles_map", {}) or {}
+    vehicle = vehicles_map.get(str(vehicle_id), {})
+
+    session["selected_vehicle_id"] = vehicle_id
+    session["selected_vehicle"] = vehicle
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "Машина выбрана")
+    show_carrier_drivers(call.message, carrier_id=carrier_id, vehicle_id=vehicle_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("select_driver_"))
+def handle_select_driver(call):
+    chat_id = call.message.chat.id
+    parts = call.data.split("_")
+    if len(parts) < 4:
+        bot.answer_callback_query(call.id, "Некорректные данные водителя")
+        return
+
+    driver_id = parts[2]
+    vehicle_id = parts[3]
+
+    session = get_session(chat_id)
+    carrier_id = session.get("selected_carrier_id", "")
+    carrier_name = session.get("selected_carrier_name", "")
+
+    drivers_map = session.get("drivers_map", {}) or {}
+    vehicles_map = session.get("vehicles_map", {}) or {}
+
+    driver = drivers_map.get(str(driver_id), {})
+    vehicle = vehicles_map.get(str(vehicle_id), session.get("selected_vehicle", {}))
+
+    session["selected_driver_id"] = driver_id
+    session["selected_driver"] = driver
+    session["selected_vehicle_id"] = vehicle_id
+    session["selected_vehicle"] = vehicle
+    save_session(chat_id, session)
+
+    form_url = build_google_form_url(
+        "trip_request",
+        carrier_id=carrier_id,
+        carrier_name=carrier_name,
+        vehicle_id=vehicle_id,
+        driver_id=driver_id,
+        route_from=session.get("route_from", ""),
+        route_to=session.get("route_to", ""),
+        pallets=session.get("pallets", ""),
+        price=session.get("price", ""),
+    )
+
+    vehicle_title = f"{vehicle.get('brand', '')} {vehicle.get('model', '')} {vehicle.get('number', '')}".strip()
+    driver_name = driver.get("full_name", "—")
+
+    text = (
+        "✅ Машина и водитель выбраны.\n\n"
+        f"Перевозчик: {carrier_name or carrier_id}\n"
+        f"Машина: {vehicle_title or vehicle_id}\n"
+        f"Водитель: {driver_name}\n\n"
+        "Данные частично заполнены. Откройте форму и завершите заявку."
+    )
+
+    if form_url:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📝 Открыть форму заявки", url=form_url))
+        bot.send_message(chat_id, text, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text)
+
+    bot.answer_callback_query(call.id, "Водитель выбран")
+
+
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     chat_id = message.chat.id
@@ -1740,6 +2283,37 @@ def handle_document(message):
         )
 
 
+@bot.message_handler(content_types=["voice"])
+def handle_voice(message):
+    chat_id = message.chat.id
+
+    with tempfile.TemporaryDirectory(prefix="voice_") as tmp_dir:
+        try:
+            bot.send_message(chat_id, "🎤 Получил голосовое. Распознаю...")
+            file_info = bot.get_file(message.voice.file_id)
+            file_bytes = bot.download_file(file_info.file_path)
+
+            voice_path = os.path.join(tmp_dir, f"{chat_id}_voice.ogg")
+            with open(voice_path, "wb") as f:
+                f.write(file_bytes)
+
+            mp3_path, convert_error = convert_ogg_to_mp3(voice_path)
+            if convert_error:
+                bot.send_message(chat_id, f"❌ {convert_error}")
+                return
+
+            text, transcribe_error = transcribe_audio_with_whisper(mp3_path)
+            if transcribe_error:
+                bot.send_message(chat_id, f"❌ {transcribe_error}")
+                return
+
+            bot.send_message(chat_id, f"🎤 Вы сказали: {text}")
+            handle_voice_command(message, text)
+        except Exception as e:
+            logger.exception("Ошибка обработки voice: %s", e)
+            bot.send_message(chat_id, "Не удалось обработать голосовое сообщение. Попробуйте ещё раз.")
+
+
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     chat_id = message.chat.id
@@ -1778,6 +2352,21 @@ def handle_text(message):
             bot.send_message(chat_id, f"✅ Заказчик выбран: {customer.get('name', '—')}")
             if session.get("scenario") == "new_carrier_contract" and session.get("awaiting_more_data"):
                 prompt_for_missing_after_customer(chat_id, session)
+            return
+
+        if session.get("awaiting_vehicle_manual_entry"):
+            vehicle_form_url = build_google_form_url("vehicle")
+            markup = InlineKeyboardMarkup()
+            if vehicle_form_url:
+                markup.add(InlineKeyboardButton("📝 Открыть форму машины", url=vehicle_form_url))
+
+            bot.send_message(
+                chat_id,
+                "Понял. Для корректной привязки машины к перевозчику используйте Google Форму.",
+                reply_markup=markup if vehicle_form_url else None,
+            )
+            session["awaiting_vehicle_manual_entry"] = False
+            save_session(chat_id, session)
             return
 
         if session.get("awaiting_carrier_card_upload"):
@@ -1822,6 +2411,14 @@ def handle_text(message):
             }
 
             apply_extracted_carrier_data(chat_id, extracted, source_hint="DaData")
+            bot.send_message(
+                chat_id,
+                "Как продолжим после автозаполнения DaData?",
+                reply_markup=build_dadata_followup_markup(inn),
+            )
+            return
+
+        if route_quick_commands(message, user_text):
             return
 
         # Если уже ждём доп.данные по новому перевозчику
@@ -1975,6 +2572,8 @@ def handle_text(message):
                 "ks": clean_digits(known.get("ks", "")),
                 "tax_mode": normalize_tax_mode(known.get("tax_mode", "")),
                 "director": known.get("director", ""),
+                "selected_vehicle_id": "",
+                "selected_driver_id": "",
             }
 
             validation_errors = validate_session_fields(session_data)
@@ -1989,6 +2588,26 @@ def handle_text(message):
 
             if not session_data.get("customer_name"):
                 show_customer_selection(chat_id)
+
+        elif result.get("scenario") == "existing_carrier_trip_request":
+            known = result.get("known", {}) or {}
+            session_data = get_session(chat_id)
+            session_data["scenario"] = "existing_carrier_trip_request"
+            session_data["route_from"] = known.get("route_from", session_data.get("route_from", ""))
+            session_data["route_to"] = known.get("route_to", session_data.get("route_to", ""))
+            session_data["route_name"] = known.get("route_name", session_data.get("route_name", ""))
+            session_data["carrier_name"] = known.get("carrier_name", session_data.get("carrier_name", ""))
+            session_data["price"] = known.get("price", session_data.get("price", ""))
+            session_data["pallets"] = known.get("pallets") or session_data.get("pallets") or extract_number(user_text)
+            session_data["selected_vehicle_id"] = session_data.get("selected_vehicle_id", "")
+            session_data["selected_driver_id"] = session_data.get("selected_driver_id", "")
+            save_session(chat_id, session_data)
+
+            pallets = int(session_data.get("pallets") or 0)
+            if pallets > 0:
+                find_suitable_carriers(message, pallets)
+            else:
+                bot.send_message(chat_id, "Для подбора перевозчиков укажите количество паллет (например: 10 паллет).")
 
     except Exception as e:
         logger.exception("Ошибка в handle_text: %s", e)

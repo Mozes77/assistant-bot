@@ -25,7 +25,13 @@
 pip install -r requirements.txt
 ```
 
-В `requirements.txt` добавлен `python-dotenv`, чтобы бот автоматически читал `.env`.
+В `requirements.txt` добавлены `python-dotenv`, `pydub`, `pypdf` и `openai`.
+
+Для голосовых сообщений нужен `ffmpeg` (pydub использует его для OGG → MP3):
+
+```bash
+sudo apt-get update && sudo apt-get install -y ffmpeg
+```
 
 #### 3) Запуск бота
 Из корня проекта:
