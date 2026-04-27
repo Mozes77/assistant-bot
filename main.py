@@ -1799,20 +1799,20 @@ def build_add_carrier_markup() -> InlineKeyboardMarkup:
     return markup
 
 
-def build_dadata_followup_markup(inn: str) -> InlineKeyboardMarkup:
+def build_dadata_followup_markup() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
-
-    carrier_form_url = build_google_form_url("carrier", inn=inn)
-    if carrier_form_url:
-        markup.add(
-            InlineKeyboardButton(
-                "📝 Дозаполнить в Google Форме",
-                url=carrier_form_url,
-            )
+    markup.add(
+        InlineKeyboardButton(
+            "📤 Загрузить карточку предприятия (фото/PDF)",
+            callback_data="upload_carrier_card",
         )
-
-    markup.add(InlineKeyboardButton("✏️ Ввести вручную", callback_data="carrier_manual_complete"))
-    markup.add(InlineKeyboardButton("⏩ Продолжить без реквизитов", callback_data="carrier_skip_details"))
+    )
+    markup.add(
+        InlineKeyboardButton(
+            "⏩ Пропустить реквизиты",
+            callback_data="skip_carrier_details",
+        )
+    )
     return markup
 
 
@@ -1932,6 +1932,135 @@ def apply_extracted_carrier_data(chat_id: int, extracted: Dict[str, Any], source
         show_customer_selection(chat_id)
 
 
+def _build_skip_markup(callback_data: str, text: str = "⏩ Пропустить") -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(text, callback_data=callback_data))
+    return markup
+
+
+def sync_session_with_carrier_data(session: Dict[str, Any]) -> Dict[str, Any]:
+    carrier_data = session.get("carrier_data") or {}
+    if not isinstance(carrier_data, dict):
+        carrier_data = {}
+
+    session["carrier_name"] = carrier_data.get("name", session.get("carrier_name", ""))
+    session["carrier_type"] = carrier_data.get("carrier_type", session.get("carrier_type", ""))
+    session["inn"] = clean_digits(carrier_data.get("inn", session.get("inn", "")))
+    session["ogrn"] = carrier_data.get("ogrn", session.get("ogrn", ""))
+    session["registration_address"] = carrier_data.get("address", session.get("registration_address", ""))
+    session["director"] = carrier_data.get("director", session.get("director", ""))
+    session["phone"] = normalize_phone(carrier_data.get("phone", session.get("phone", "")))
+    session["email"] = carrier_data.get("email", session.get("email", ""))
+    session["bank"] = carrier_data.get("bank", session.get("bank", ""))
+    session["rs"] = clean_digits(carrier_data.get("account", carrier_data.get("rs", session.get("rs", ""))))
+    session["ks"] = clean_digits(carrier_data.get("corr_account", carrier_data.get("ks", session.get("ks", ""))))
+    session["bik"] = clean_digits(carrier_data.get("bik", session.get("bik", "")))
+
+    tax_mode = normalize_tax_mode(carrier_data.get("tax_mode", session.get("tax_mode", "")))
+    if tax_mode:
+        session["tax_mode"] = tax_mode
+        carrier_data["tax_mode"] = tax_mode
+
+    session["carrier_data"] = carrier_data
+    return session
+
+
+def save_carrier_to_sheets(chat_id: int) -> bool:
+    session = get_session(chat_id)
+    carrier_data = session.get("carrier_data") or {}
+    if not carrier_data:
+        return False
+
+    url = os.getenv("GOOGLE_SCRIPT_URL")
+    if not url:
+        logger.warning("GOOGLE_SCRIPT_URL не задан")
+        return False
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "action": "create_carrier",
+                "carrier_data": carrier_data,
+            },
+            timeout=GOOGLE_SCRIPT_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        logger.exception("Ошибка сохранения перевозчика в Google Sheets: %s", e)
+        return False
+
+    if data.get("success"):
+        session["carrier_id"] = data.get("carrier_id", "")
+        save_session(chat_id, session)
+        return True
+
+    result = data.get("result", {}) if isinstance(data, dict) else {}
+    if data.get("ok") and isinstance(result, dict) and result.get("success"):
+        session["carrier_id"] = result.get("carrier_id", "")
+        save_session(chat_id, session)
+        return True
+
+    logger.error("create_carrier: неожиданный ответ Google Script: %s", data)
+    return False
+
+
+def finalize_carrier_profile(chat_id: int):
+    session = get_session(chat_id)
+    session = sync_session_with_carrier_data(session)
+    save_session(chat_id, session)
+
+    if not save_carrier_to_sheets(chat_id):
+        bot.send_message(
+            chat_id,
+            "❌ Не удалось сохранить перевозчика в Google Sheets. Попробуйте ещё раз позже.",
+        )
+        return
+
+    session = get_session(chat_id)
+    carrier_data = session.get("carrier_data") or {}
+    session["state"] = ""
+    session["awaiting_carrier_inn"] = False
+    session["awaiting_carrier_card_upload"] = False
+    save_session(chat_id, session)
+
+    bot.send_message(
+        chat_id,
+        "✅ Перевозчик добавлен!\n\n"
+        f"Название: {carrier_data.get('name', '—')}\n"
+        f"Телефон: {carrier_data.get('phone', '—')}\n"
+        f"Email: {carrier_data.get('email', '—')}",
+    )
+
+
+def merge_extracted_into_carrier_data(session: Dict[str, Any], extracted: Dict[str, Any]) -> Dict[str, Any]:
+    carrier_data = session.get("carrier_data") or {}
+
+    mapped = {
+        "name": extracted.get("name") or extracted.get("carrier_name", ""),
+        "carrier_type": extracted.get("carrier_type", ""),
+        "inn": extracted.get("inn", ""),
+        "ogrn": extracted.get("ogrn", ""),
+        "address": extracted.get("address") or extracted.get("registration_address", ""),
+        "director": extracted.get("director", ""),
+        "phone": normalize_phone(extracted.get("phone", "")),
+        "email": extracted.get("email", "").strip(),
+        "bank": extracted.get("bank", ""),
+        "account": clean_digits(extracted.get("account") or extracted.get("rs", "")),
+        "corr_account": clean_digits(extracted.get("corr_account") or extracted.get("ks", "")),
+        "bik": clean_digits(extracted.get("bik", "")),
+        "tax_mode": normalize_tax_mode(extracted.get("tax_mode", "")),
+    }
+
+    for key, value in mapped.items():
+        if value:
+            carrier_data[key] = value
+
+    session["carrier_data"] = carrier_data
+    return sync_session_with_carrier_data(session)
+
+
 # =========================
 # TELEGRAM
 # =========================
@@ -1966,6 +2095,7 @@ def handle_refresh_carriers(message):
     session = get_session(chat_id)
     session["awaiting_carrier_card_upload"] = False
     session["awaiting_carrier_inn"] = False
+    session["state"] = ""
     save_session(chat_id, session)
 
     bot.send_message(
@@ -2090,35 +2220,87 @@ def handle_vehicle_manual_entry(call):
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "carrier_manual_complete")
-def handle_carrier_manual_complete(call):
+@bot.callback_query_handler(func=lambda call: call.data in ("carrier_manual_complete", "upload_carrier_card"))
+def handle_upload_carrier_card(call):
     chat_id = call.message.chat.id
     session = get_session(chat_id)
-    session["awaiting_more_data"] = True
-    session["carrier_details_skipped"] = False
+    session["state"] = "waiting_carrier_bank"
+    session["awaiting_carrier_card_upload"] = True
+    session["awaiting_carrier_inn"] = False
     save_session(chat_id, session)
 
     bot.answer_callback_query(call.id)
     bot.send_message(
         chat_id,
-        "Введите недостающие реквизиты одним сообщением (телефон, email, банк, р/с, БИК, к/с, налогообложение).",
+        "📤 Загрузите карточку предприятия (фото или PDF), я извлеку реквизиты автоматически.",
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "carrier_skip_details")
-def handle_carrier_skip_details(call):
+@bot.callback_query_handler(func=lambda call: call.data in ("skip_carrier_details", "carrier_skip_details"))
+def handle_skip_carrier_details(call):
     chat_id = call.message.chat.id
     session = get_session(chat_id)
-    session["carrier_details_skipped"] = True
-    session["awaiting_more_data"] = False
+    session["state"] = ""
+    session["awaiting_carrier_card_upload"] = False
+    session["awaiting_carrier_inn"] = False
     save_session(chat_id, session)
 
     bot.answer_callback_query(call.id)
+    finalize_carrier_profile(chat_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "skip_email")
+def handle_skip_email(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    carrier_data = session.get("carrier_data") or {}
+    carrier_data["email"] = ""
+    session["carrier_data"] = carrier_data
+    session["email"] = ""
+    session["state"] = "waiting_carrier_bank"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📤 Загрузить карточку с реквизитами", callback_data="upload_bank_card"))
+    markup.add(InlineKeyboardButton("⏩ Пропустить", callback_data="skip_bank"))
     bot.send_message(
         chat_id,
-        "✅ Принято. Продолжаем без реквизитов.\n"
-        "Теперь можно перейти к заявке на рейс (например: 'Нужна машина 10 паллет').",
+        "📩 Email пропущен.\n\n"
+        "🏦 Пришлите банк, р/с, БИК, к/с и режим налогообложения одним сообщением\n"
+        "или загрузите карточку предприятия:",
+        reply_markup=markup,
     )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "upload_bank_card")
+def handle_upload_bank_card(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_carrier_bank"
+    session["awaiting_carrier_card_upload"] = True
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "📤 Загрузите карточку с банковскими реквизитами (фото/PDF).")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "skip_bank")
+def handle_skip_bank(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    carrier_data = session.get("carrier_data") or {}
+    carrier_data.setdefault("bank", "")
+    carrier_data.setdefault("account", "")
+    carrier_data.setdefault("corr_account", "")
+    carrier_data.setdefault("bik", "")
+    session["carrier_data"] = carrier_data
+    session["state"] = ""
+    session["awaiting_carrier_card_upload"] = False
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    finalize_carrier_profile(chat_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("select_carrier_auto_"))
@@ -2242,6 +2424,17 @@ def handle_photo(message):
             bot.send_message(chat_id, f"Ошибка распознавания карточки: {extract_error}")
             return
 
+        session = get_session(chat_id)
+        state = session.get("state", "")
+        if state in ("waiting_carrier_phone", "waiting_carrier_bank") or session.get("awaiting_carrier_card_upload"):
+            bot.send_message(chat_id, "⏳ Обрабатываю карточку предприятия...")
+            session = merge_extracted_into_carrier_data(session, extracted)
+            session["state"] = ""
+            session["awaiting_carrier_card_upload"] = False
+            save_session(chat_id, session)
+            finalize_carrier_profile(chat_id)
+            return
+
         apply_extracted_carrier_data(chat_id, extracted, source_hint="фото")
 
     except Exception as e:
@@ -2271,6 +2464,17 @@ def handle_document(message):
         extracted, extract_error = extract_card_data_from_document(file_bytes, mime_type, file_name)
         if extract_error:
             bot.send_message(chat_id, f"Ошибка распознавания карточки: {extract_error}")
+            return
+
+        session = get_session(chat_id)
+        state = session.get("state", "")
+        if state in ("waiting_carrier_phone", "waiting_carrier_bank") or session.get("awaiting_carrier_card_upload"):
+            bot.send_message(chat_id, "⏳ Обрабатываю карточку предприятия...")
+            session = merge_extracted_into_carrier_data(session, extracted)
+            session["state"] = ""
+            session["awaiting_carrier_card_upload"] = False
+            save_session(chat_id, session)
+            finalize_carrier_profile(chat_id)
             return
 
         apply_extracted_carrier_data(chat_id, extracted, source_hint=file_name)
@@ -2325,6 +2529,81 @@ def handle_text(message):
 
     try:
         session = get_session(chat_id)
+        state = session.get("state", "")
+
+        if state == "waiting_carrier_phone":
+            phone = normalize_phone(user_text)
+            if not phone:
+                bot.send_message(chat_id, "❌ Неверный формат. Пример: +7 (924) 530-66-66")
+                return
+
+            carrier_data = session.get("carrier_data") or {}
+            carrier_data["phone"] = phone
+            session["carrier_data"] = carrier_data
+            session["phone"] = phone
+            session["state"] = "waiting_carrier_email"
+            save_session(chat_id, session)
+
+            bot.send_message(
+                chat_id,
+                f"✅ Телефон: {phone}\n\n📧 Отправьте email перевозчика:",
+                reply_markup=_build_skip_markup("skip_email"),
+            )
+            return
+
+        if state == "waiting_carrier_email":
+            email = (user_text or "").strip()
+            if not validate_email(email):
+                bot.send_message(chat_id, "❌ Неверный email")
+                return
+
+            carrier_data = session.get("carrier_data") or {}
+            carrier_data["email"] = email
+            session["carrier_data"] = carrier_data
+            session["email"] = email
+            session["state"] = "waiting_carrier_bank"
+            save_session(chat_id, session)
+
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("📤 Загрузить карточку с реквизитами", callback_data="upload_bank_card"))
+            markup.add(InlineKeyboardButton("⏩ Пропустить", callback_data="skip_bank"))
+            bot.send_message(
+                chat_id,
+                f"✅ Email: {email}\n\n"
+                "🏦 Пришлите банк, р/с, БИК, к/с и режим налогообложения одним сообщением\n"
+                "или загрузите карточку предприятия:",
+                reply_markup=markup,
+            )
+            return
+
+        if state == "waiting_carrier_bank":
+            parsed = parse_bulk_reply(user_text, {})
+            carrier_data = session.get("carrier_data") or {}
+
+            if parsed.get("bank"):
+                carrier_data["bank"] = parsed.get("bank")
+            if parsed.get("rs"):
+                carrier_data["account"] = parsed.get("rs")
+            if parsed.get("ks"):
+                carrier_data["corr_account"] = parsed.get("ks")
+            if parsed.get("bik"):
+                carrier_data["bik"] = parsed.get("bik")
+            if parsed.get("tax_mode"):
+                carrier_data["tax_mode"] = parsed.get("tax_mode")
+
+            if not carrier_data.get("bank"):
+                bot.send_message(
+                    chat_id,
+                    "❌ Не вижу название банка. Пришлите банк, р/с, БИК, к/с и режим налогообложения одним сообщением.",
+                    reply_markup=_build_skip_markup("skip_bank"),
+                )
+                return
+
+            session["carrier_data"] = carrier_data
+            session["state"] = ""
+            save_session(chat_id, session)
+            finalize_carrier_profile(chat_id)
+            return
 
         if session.get("awaiting_customer_inn"):
             inn = clean_digits(user_text)
@@ -2401,20 +2680,30 @@ def handle_text(message):
                 )
                 return
 
-            extracted = {
-                "carrier_name": company.get("name", ""),
+            carrier_data = {
+                "name": company.get("name", ""),
                 "carrier_type": company.get("carrier_type", ""),
                 "inn": inn,
                 "ogrn": company.get("ogrn", ""),
-                "registration_address": company.get("address", ""),
+                "address": company.get("address", ""),
                 "director": company.get("director", ""),
+                "tax_mode": normalize_tax_mode(session.get("tax_mode", "")),
             }
 
-            apply_extracted_carrier_data(chat_id, extracted, source_hint="DaData")
+            session["carrier_data"] = carrier_data
+            session["state"] = "waiting_carrier_phone"
+            session["awaiting_carrier_inn"] = False
+            session["awaiting_carrier_card_upload"] = False
+            session["awaiting_more_data"] = False
+            session = sync_session_with_carrier_data(session)
+            save_session(chat_id, session)
+
             bot.send_message(
                 chat_id,
-                "Как продолжим после автозаполнения DaData?",
-                reply_markup=build_dadata_followup_markup(inn),
+                "✅ Основные данные получены!\n\n"
+                "📞 Отправьте телефон перевозчика\n"
+                "или загрузите карточку предприятия с реквизитами:",
+                reply_markup=build_dadata_followup_markup(),
             )
             return
 
@@ -2581,6 +2870,46 @@ def handle_text(message):
                 bot.send_message(chat_id, format_validation_errors_for_user(validation_errors))
 
             save_session(chat_id, session_data)
+
+            if session_data.get("inn"):
+                carrier_data = {
+                    "name": session_data.get("carrier_name", ""),
+                    "carrier_type": session_data.get("carrier_type", ""),
+                    "inn": session_data.get("inn", ""),
+                    "ogrn": session_data.get("ogrn", ""),
+                    "address": session_data.get("registration_address", ""),
+                    "director": session_data.get("director", ""),
+                    "tax_mode": session_data.get("tax_mode", ""),
+                    "phone": session_data.get("phone", ""),
+                    "email": session_data.get("email", ""),
+                    "bank": session_data.get("bank", ""),
+                    "account": session_data.get("rs", ""),
+                    "corr_account": session_data.get("ks", ""),
+                    "bik": session_data.get("bik", ""),
+                }
+                session_data["carrier_data"] = carrier_data
+                if not session_data.get("phone"):
+                    session_data["state"] = "waiting_carrier_phone"
+                    session_data["awaiting_more_data"] = False
+                    save_session(chat_id, session_data)
+                    bot.send_message(
+                        chat_id,
+                        "✅ Основные данные получены!\n\n"
+                        "📞 Отправьте телефон перевозчика\n"
+                        "или загрузите карточку предприятия с реквизитами:",
+                        reply_markup=build_dadata_followup_markup(),
+                    )
+                    return
+                if not session_data.get("email"):
+                    session_data["state"] = "waiting_carrier_email"
+                    session_data["awaiting_more_data"] = False
+                    save_session(chat_id, session_data)
+                    bot.send_message(
+                        chat_id,
+                        "✅ Телефон уже есть.\n\n📧 Отправьте email перевозчика:",
+                        reply_markup=_build_skip_markup("skip_email"),
+                    )
+                    return
 
             if not session_data.get("inn") and not session_data.get("carrier_name"):
                 show_carrier_add_options(message)
