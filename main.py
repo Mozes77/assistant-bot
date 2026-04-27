@@ -108,6 +108,65 @@ def load_config() -> Dict[str, Any]:
 CONFIG = load_config()
 CUSTOMERS = CONFIG.get("customers", [])
 
+
+def get_customer_by_code(code: str) -> dict:
+    """Получить полные реквизиты заказчика по коду."""
+    for c in CUSTOMERS:
+        if c.get("code", "").upper() == code.upper():
+            return c
+    return {}
+
+
+def get_customer_by_inn(inn: str) -> dict:
+    """Получить заказчика по ИНН."""
+    for c in CUSTOMERS:
+        if c.get("inn") == inn:
+            return c
+    return {}
+
+
+def get_customer_by_alias(text: str) -> dict:
+    """Найти заказчика по алиасу или имени."""
+    t = (text or "").lower().strip()
+    for c in CUSTOMERS:
+        name = (c.get("name") or "").lower()
+        if name and name in t:
+            return c
+        for alias in (c.get("aliases") or []):
+            if alias and alias.lower() in t:
+                return c
+    return {}
+
+
+def format_customer_choice() -> str:
+    """Сформировать меню выбора заказчика."""
+    if len(CUSTOMERS) == 0:
+        return "Заказчиков нет в базе. Добавьте через config.json."
+    if len(CUSTOMERS) == 1:
+        c = CUSTOMERS[0]
+        return f"Заказчик: {c.get('name', '?')} (ИНН: {c.get('inn', '?')})"
+    lines = ["Выберите заказчика (номер или название):"]
+    for i, c in enumerate(CUSTOMERS, 1):
+        inn = c.get("inn", "")
+        inn_str = f" (ИНН: {inn})" if inn else ""
+        lines.append(f"{i}. {c.get('name', '?')}{inn_str}")
+    return "\n".join(lines)
+
+
+def auto_select_customer(session: dict) -> bool:
+    """Автоматически выбрать заказчика если он один в базе.
+    Возвращает True если заказчик выбран."""
+    if session.get("customer_name"):
+        return True
+    if len(CUSTOMERS) == 1:
+        c = CUSTOMERS[0]
+        session["customer_name"] = c.get("name", "")
+        session["customer_code"] = c.get("code", "")
+        session["customer_data"] = c
+        logger.info("Автовыбор заказчика: %s", c.get("name"))
+        return True
+    return False
+
 VALID_TAX_MODES = ("ОСНО", "УСН", "Патент", "Самозанятый")
 TAX_MODE_PROMPT = "налогообложение (ОСНО / УСН / Патент / Самозанятый)"
 TAX_MODE_HINTS = (
@@ -494,8 +553,8 @@ SYSTEM_PROMPT = """
   "known": {
     "inn": "381234567890"
   },
-  "missing": ["customer_name", "phone", "email", "bank", "rs", "bik", "ks", "tax_mode"],
-  "next_question": "Укажите заказчика, телефон, email, банк, расчетный счет, БИК, корр. счет и налогообложение (ОСНО / УСН / Патент / Самозанятый)."
+  "missing": ["phone", "email", "bank", "rs", "bik", "ks", "tax_mode"],
+  "next_question": "Укажите телефон, email, банк, расчетный счет, БИК, корр. счет и налогообложение (ОСНО / УСН / Патент / Самозанятый)."
 }
 
 Если сценарий неясен, верни:
@@ -700,12 +759,44 @@ def enrich_result_with_dadata(result: Dict[str, Any]) -> Tuple[Dict[str, Any], s
     result["missing"] = new_missing
 
     if result.get("scenario") == "new_carrier_contract":
-        result["next_question"] = (
-            "Нашёл данные по ИНН.\n"
-            "Пришлите одним сообщением:\n"
-            f"заказчик, телефон, email, банк, расчетный счет, БИК, корр. счет, {TAX_MODE_PROMPT}.\n\n"
-            f"{TAX_MODE_HINTS}"
-        )
+        # Автовыбор заказчика
+        if len(CUSTOMERS) == 1:
+            c = CUSTOMERS[0]
+            known["customer_name"] = c.get("name", "")
+            result["known"] = known
+            if "customer_name" in result.get("missing", []):
+                result["missing"].remove("customer_name")
+            customer_info = f"Заказчик: {c.get('name', '')} (автоматически)\n"
+        elif len(CUSTOMERS) > 1:
+            customer_info = format_customer_choice() + "\n"
+        else:
+            customer_info = ""
+        
+        remaining = [f for f in result.get("missing", []) if f != "customer_name"]
+        if remaining:
+            fields_str = ", ".join([{
+                "phone": "телефон",
+                "email": "email", 
+                "bank": "банк",
+                "rs": "расчетный счет",
+                "bik": "БИК",
+                "ks": "корр. счет",
+                "tax_mode": TAX_MODE_PROMPT,
+                "customer_name": "заказчик",
+            }.get(f, f) for f in remaining])
+            result["next_question"] = (
+                f"Нашёл данные по ИНН.\n"
+                f"{customer_info}"
+                f"Пришлите одним сообщением:\n"
+                f"{fields_str}.\n\n"
+                f"{TAX_MODE_HINTS}"
+            )
+        else:
+            result["next_question"] = (
+                f"Нашёл данные по ИНН.\n"
+                f"{customer_info}"
+                f"Все обязательные данные получены!"
+            )
 
     return result, ""
 
@@ -1044,6 +1135,9 @@ def parse_bulk_reply(text: str, session: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def missing_session_fields(session: Dict[str, Any]) -> List[str]:
+    # Автовыбор заказчика если один в базе
+    auto_select_customer(session)
+    
     required = ["customer_name", "phone", "email", "bank", "rs", "bik", "ks", "tax_mode"]
     missing = []
 
@@ -1276,10 +1370,27 @@ def handle_text(message):
                 bot.send_message(chat_id, "\n\n".join(messages))
                 return
 
+            # Получаем полные данные заказчика
+            cust = session.get("customer_data") or get_customer_by_alias(session.get("customer_name", ""))
+            if not cust:
+                cust = get_customer_by_code("FRUKT_SERVICE")
+            
             payload = {
                 "action": "create_carrier_and_contract",
-                "customer_name": session.get("customer_name", ""),
-                "customer_code": detect_customer_code(session.get("customer_name", "")),
+                "customer_name": cust.get("name", session.get("customer_name", "")),
+                "customer_code": cust.get("code", detect_customer_code(session.get("customer_name", ""))),
+                "customer_inn": cust.get("inn", ""),
+                "customer_kpp": cust.get("kpp", ""),
+                "customer_director": cust.get("director", ""),
+                "customer_basis": cust.get("basis", ""),
+                "customer_address": cust.get("address", ""),
+                "customer_phone": cust.get("phone", ""),
+                "customer_email": cust.get("email", ""),
+                "customer_bank": cust.get("bank", ""),
+                "customer_rs": cust.get("rs", ""),
+                "customer_ks": cust.get("ks", ""),
+                "customer_bik": cust.get("bik", ""),
+                "customer_tax_mode": cust.get("tax_mode", ""),
                 "name": session.get("carrier_name", ""),
                 "form": session.get("carrier_type", ""),
                 "inn": session.get("inn", ""),
