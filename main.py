@@ -1023,6 +1023,25 @@ def call_google_script(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     return data, ""
 
 
+def check_carrier_exists_in_sheets(inn: str) -> Tuple[Dict[str, Any], str]:
+    payload = {
+        "action": "check_carrier_exists",
+        "inn": clean_digits(inn),
+    }
+    data, error = call_google_script(payload)
+    if error:
+        return {}, error
+
+    if data.get("ok") and isinstance(data.get("result"), dict):
+        return data.get("result", {}), ""
+
+    if isinstance(data, dict) and "exists" in data:
+        return data, ""
+
+    logger.error("check_carrier_exists: неожиданный ответ Google Script: %s", data)
+    return {}, "Google Script вернул неожиданный ответ при проверке дубликата по ИНН."
+
+
 # =========================
 # ФОРМАТ ОТВЕТА
 # =========================
@@ -1816,6 +1835,29 @@ def build_dadata_followup_markup() -> InlineKeyboardMarkup:
     return markup
 
 
+def build_existing_carrier_actions(carrier_id: str) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(
+            "🔄 Обновить данные",
+            callback_data=f"update_carrier_{carrier_id}",
+        )
+    )
+    markup.add(
+        InlineKeyboardButton(
+            "👁️ Посмотреть текущие данные",
+            callback_data=f"view_carrier_{carrier_id}",
+        )
+    )
+    markup.add(
+        InlineKeyboardButton(
+            "❌ Отменить",
+            callback_data="cancel_carrier",
+        )
+    )
+    return markup
+
+
 def show_carrier_add_options(message):
     """Показать варианты добавления перевозчика"""
     bot.send_message(
@@ -1993,12 +2035,16 @@ def save_carrier_to_sheets(chat_id: int) -> bool:
 
     if data.get("success"):
         session["carrier_id"] = data.get("carrier_id", "")
+        session["carrier_save_action"] = data.get("action", "created")
+        session["carrier_save_message"] = data.get("message", "")
         save_session(chat_id, session)
         return True
 
     result = data.get("result", {}) if isinstance(data, dict) else {}
     if data.get("ok") and isinstance(result, dict) and result.get("success"):
         session["carrier_id"] = result.get("carrier_id", "")
+        session["carrier_save_action"] = result.get("action", "created")
+        session["carrier_save_message"] = result.get("message", "")
         save_session(chat_id, session)
         return True
 
@@ -2020,17 +2066,27 @@ def finalize_carrier_profile(chat_id: int):
 
     session = get_session(chat_id)
     carrier_data = session.get("carrier_data") or {}
+    save_action = session.get("carrier_save_action", "created")
+    save_message = session.get("carrier_save_message", "")
+
     session["state"] = ""
     session["awaiting_carrier_inn"] = False
     session["awaiting_carrier_card_upload"] = False
+    session["awaiting_carrier_duplicate_decision"] = False
+    session.pop("pending_carrier_data", None)
+    session.pop("existing_carrier", None)
     save_session(chat_id, session)
+
+    status_emoji = "🔄" if save_action == "updated" else "✅"
+    status_text = "Перевозчик обновлён" if save_action == "updated" else "Перевозчик добавлен"
 
     bot.send_message(
         chat_id,
-        "✅ Перевозчик добавлен!\n\n"
+        f"{status_emoji} {status_text}!\n\n"
         f"Название: {carrier_data.get('name', '—')}\n"
         f"Телефон: {carrier_data.get('phone', '—')}\n"
-        f"Email: {carrier_data.get('email', '—')}",
+        f"Email: {carrier_data.get('email', '—')}"
+        + (f"\n\n{save_message}" if save_message else ""),
     )
 
 
@@ -2175,6 +2231,9 @@ def handle_carrier_inn_entry(call):
     session["awaiting_more_data"] = True
     session["awaiting_carrier_inn"] = True
     session["awaiting_carrier_card_upload"] = False
+    session["awaiting_carrier_duplicate_decision"] = False
+    session.pop("pending_carrier_data", None)
+    session.pop("existing_carrier", None)
     save_session(chat_id, session)
 
     bot.answer_callback_query(call.id)
@@ -2192,6 +2251,9 @@ def handle_carrier_card_upload(call):
     session["awaiting_more_data"] = True
     session["awaiting_carrier_card_upload"] = True
     session["awaiting_carrier_inn"] = False
+    session["awaiting_carrier_duplicate_decision"] = False
+    session.pop("pending_carrier_data", None)
+    session.pop("existing_carrier", None)
     save_session(chat_id, session)
 
     bot.answer_callback_query(call.id)
@@ -2200,6 +2262,102 @@ def handle_carrier_card_upload(call):
         "📄 Загрузите карточку компании в формате DOCX, PDF или фото.\n\n"
         "Я автоматически извлеку все реквизиты.",
     )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view_carrier_"))
+def handle_view_existing_carrier(call):
+    chat_id = call.message.chat.id
+    carrier_id = call.data.replace("view_carrier_", "", 1)
+    session = get_session(chat_id)
+    existing = session.get("existing_carrier") or {}
+
+    if not existing or str(existing.get("id", "")) != carrier_id:
+        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, "Не удалось найти данные перевозчика в сессии. Введите ИНН ещё раз.")
+        return
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        f"📋 Текущая карточка перевозчика:\n"
+        f"• ID: {existing.get('id', '—')}\n"
+        f"• Название: {existing.get('name', '—')}\n"
+        f"• ИНН: {existing.get('inn', '—')}\n"
+        f"• Телефон: {existing.get('phone', '—') or '—'}\n"
+        f"• Email: {existing.get('email', '—') or '—'}\n"
+        f"• Банк: {existing.get('bank', '—') or '—'}\n"
+        f"• Р/с: {existing.get('rs', '—') or '—'}\n"
+        f"• БИК: {existing.get('bik', '—') or '—'}\n"
+        f"• К/с: {existing.get('ks', '—') or '—'}\n"
+        f"• Налоговый режим: {existing.get('tax_mode', '—') or '—'}",
+        reply_markup=build_existing_carrier_actions(carrier_id),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("update_carrier_"))
+def handle_update_existing_carrier(call):
+    chat_id = call.message.chat.id
+    carrier_id = call.data.replace("update_carrier_", "", 1)
+    session = get_session(chat_id)
+    pending = session.get("pending_carrier_data") or {}
+    existing = session.get("existing_carrier") or {}
+
+    if not existing or str(existing.get("id", "")) != carrier_id:
+        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, "Не удалось запустить обновление. Повторите ввод ИНН.")
+        return
+
+    merged_carrier_data = {
+        "id": existing.get("id", ""),
+        "name": pending.get("name") or existing.get("name", ""),
+        "carrier_type": pending.get("carrier_type") or existing.get("carrier_type", ""),
+        "inn": pending.get("inn") or existing.get("inn", ""),
+        "ogrn": pending.get("ogrn") or existing.get("ogrn", ""),
+        "address": pending.get("address") or existing.get("registration_address", ""),
+        "director": pending.get("director") or existing.get("director", ""),
+        "phone": existing.get("phone", ""),
+        "email": existing.get("email", ""),
+        "bank": existing.get("bank", ""),
+        "account": existing.get("rs", ""),
+        "bik": existing.get("bik", ""),
+        "corr_account": existing.get("ks", ""),
+        "tax_mode": pending.get("tax_mode") or existing.get("tax_mode", ""),
+    }
+
+    session["carrier_data"] = merged_carrier_data
+    session["awaiting_carrier_duplicate_decision"] = False
+    session["awaiting_carrier_inn"] = False
+    session["awaiting_carrier_card_upload"] = False
+    session["awaiting_more_data"] = False
+    session["state"] = "waiting_carrier_phone"
+    session = sync_session_with_carrier_data(session)
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "Запускаю обновление")
+    bot.send_message(
+        chat_id,
+        "🔄 Режим обновления существующего перевозчика.\n\n"
+        f"Текущий телефон: {existing.get('phone', '—') or '—'}\n"
+        "Отправьте новый телефон (если нужно)\n"
+        "или сразу загрузите карточку / нажмите «Пропустить реквизиты».",
+        reply_markup=build_dadata_followup_markup(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "cancel_carrier")
+def handle_cancel_existing_carrier(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["awaiting_carrier_duplicate_decision"] = False
+    session["awaiting_carrier_inn"] = False
+    session["awaiting_carrier_card_upload"] = False
+    session.pop("pending_carrier_data", None)
+    session.pop("existing_carrier", None)
+    session["state"] = ""
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "Отменено")
+    bot.send_message(chat_id, "❌ Операция с перевозчиком отменена.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "vehicle_manual_entry")
@@ -2689,6 +2847,34 @@ def handle_text(message):
                 "director": company.get("director", ""),
                 "tax_mode": normalize_tax_mode(session.get("tax_mode", "")),
             }
+
+            exists_result, exists_error = check_carrier_exists_in_sheets(inn)
+            if exists_error:
+                logger.warning("Проверка дубликатов по ИНН недоступна: %s", exists_error)
+            elif exists_result.get("exists"):
+                existing = exists_result.get("carrier") or {}
+                existing_id = str(existing.get("id", ""))
+
+                session["pending_carrier_data"] = carrier_data
+                session["existing_carrier"] = existing
+                session["awaiting_carrier_duplicate_decision"] = True
+                session["awaiting_carrier_inn"] = False
+                session["awaiting_carrier_card_upload"] = False
+                session["awaiting_more_data"] = False
+                save_session(chat_id, session)
+
+                bot.send_message(
+                    chat_id,
+                    f"⚠️ Перевозчик с ИНН {inn} уже есть в базе!\n\n"
+                    f"📋 Текущие данные:\n"
+                    f"• Название: {existing.get('name', '—')}\n"
+                    f"• Телефон: {existing.get('phone', '—') or '—'}\n"
+                    f"• Email: {existing.get('email', '—') or '—'}\n"
+                    f"• Банк: {existing.get('bank', '—') or '—'}\n\n"
+                    "Что делать?",
+                    reply_markup=build_existing_carrier_actions(existing_id),
+                )
+                return
 
             session["carrier_data"] = carrier_data
             session["state"] = "waiting_carrier_phone"
