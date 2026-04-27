@@ -76,6 +76,7 @@ DADATA_TOKEN = os.environ.get("DADATA_TOKEN") or os.environ.get("DADATA_API_KEY"
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_CARD_MODEL = "gpt-4o-mini"
 
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
@@ -725,57 +726,52 @@ def download_telegram_file(file_id: str) -> Tuple[bytes, str]:
     return response.content, ""
 
 
-def extract_card_data_from_image(image_bytes: bytes) -> Tuple[Dict[str, Any], str]:
+def parse_company_card(content: Any, source_type: str = "image") -> Tuple[Dict[str, Any], str]:
+    """Распознает карточку предприятия (фото/текст) и возвращает нормализованный JSON."""
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY не задан")
         return {}, "Сервис OpenAI не настроен (нет API-ключа)."
 
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = (
+        "Ты извлекаешь реквизиты перевозчика из карточки предприятия. "
+        "Верни строго JSON без markdown и без пояснений. "
+        "Если поле не найдено, верни пустую строку.\n\n"
+        "Поля JSON: name, carrier_name, carrier_short_name, carrier_type, inn, kpp, ogrn, snils, "
+        "address, registration_address, post_address, director, basis, phone, phone2, email, "
+        "emails, bank, bank_city, account, rs, corr_account, ks, bik, tax_mode, edo.\n\n"
+        "Правила:\n"
+        "- carrier_type: только ИП / ООО / САМОЗАНЯТЫЙ\n"
+        "- ИНН, КПП, ОГРН/ОГРНИП, БИК, р/с, к/с возвращай строками\n"
+        "- phone и email — основные, phone2/emails можно заполнить дополнительными значениями\n"
+        "- Если найдено ФИО ИП, можно дублировать его в director\n"
+        "- Ничего кроме JSON"
+    )
 
-    prompt = """
-Ты извлекаешь реквизиты перевозчика с фото карточки предприятия.
-Нужно вернуть ТОЛЬКО JSON без пояснений.
+    content_parts = [{"type": "input_text", "text": prompt}]
+    timeout = OPENAI_ROUTER_TIMEOUT
 
-Если поле не найдено — верни пустую строку.
-
-Поля:
-- carrier_name
-- carrier_short_name
-- carrier_type
-- inn
-- ogrn
-- registration_address
-- phone
-- email
-- bank
-- bank_city
-- rs
-- ks
-- bik
-- director
-
-Правила:
-- Если это ИП, carrier_type = "ИП"
-- Если это ООО, carrier_type = "ООО"
-- Если это самозанятый, carrier_type = "САМОЗАНЯТЫЙ"
-- ОГРНИП записывай в поле ogrn
-- Если видишь ФИО ИП, director можно продублировать этим же ФИО
-- Верни строго JSON
-"""
+    if source_type == "image":
+        base64_image = base64.b64encode(content).decode("utf-8")
+        content_parts.append(
+            {
+                "type": "input_image",
+                "image_url": f"data:image/jpeg;base64,{base64_image}",
+                "detail": "high",
+            }
+        )
+        timeout = OPENAI_VISION_TIMEOUT
+    else:
+        text_content = str(content or "").strip()
+        if not text_content:
+            return {}, "Не удалось извлечь текст из документа."
+        content_parts.append({"type": "input_text", "text": f"Текст карточки:\n{text_content[:15000]}"})
 
     payload = {
-        "model": OPENAI_MODEL,
+        "model": OPENAI_CARD_MODEL,
         "input": [
             {
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{base64_image}",
-                        "detail": "high",
-                    },
-                ],
+                "content": content_parts,
             }
         ],
         "store": False,
@@ -790,8 +786,8 @@ def extract_card_data_from_image(image_bytes: bytes) -> Tuple[Dict[str, Any], st
         url="https://api.openai.com/v1/responses",
         payload=payload,
         headers=headers,
-        timeout=OPENAI_VISION_TIMEOUT,
-        source="OpenAI Vision",
+        timeout=timeout,
+        source="OpenAI Company Card Parser",
     )
     if error:
         return {}, error
@@ -799,66 +795,18 @@ def extract_card_data_from_image(image_bytes: bytes) -> Tuple[Dict[str, Any], st
     output_text = extract_output_text(data)
     parsed, parse_error = safe_json_loads(output_text)
     if parse_error:
-        logger.error("OpenAI vision: ошибка парсинга JSON: %s", parse_error)
-        return {}, "Не удалось корректно распознать карточку. Попробуйте более четкое фото."
+        logger.error("parse_company_card: ошибка парсинга JSON: %s", parse_error)
+        return {}, "Не удалось корректно распознать карточку. Попробуйте более четкое фото или PDF."
 
     return parsed, ""
+
+
+def extract_card_data_from_image(image_bytes: bytes) -> Tuple[Dict[str, Any], str]:
+    return parse_company_card(image_bytes, source_type="image")
 
 
 def extract_card_data_from_text(raw_text: str) -> Tuple[Dict[str, Any], str]:
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY не задан")
-        return {}, "Сервис OpenAI не настроен (нет API-ключа)."
-
-    text = (raw_text or "").strip()
-    if not text:
-        return {}, "Не удалось извлечь текст из документа."
-
-    prompt = (
-        "Ты извлекаешь реквизиты перевозчика из текста карточки компании. "
-        "Верни строго JSON (без markdown и пояснений).\n\n"
-        "Если поле не найдено — верни пустую строку.\n"
-        "Поля JSON: carrier_name, carrier_short_name, carrier_type, inn, ogrn, registration_address, "
-        "phone, email, bank, bank_city, rs, ks, bik, director.\n"
-        "Правила: carrier_type только ИП/ООО/САМОЗАНЯТЫЙ."
-    )
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_text", "text": f"Текст карточки:\n{text[:12000]}"},
-                ],
-            }
-        ],
-        "store": False,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    data, error = post_json_with_handling(
-        url="https://api.openai.com/v1/responses",
-        payload=payload,
-        headers=headers,
-        timeout=OPENAI_ROUTER_TIMEOUT,
-        source="OpenAI Text OCR",
-    )
-    if error:
-        return {}, error
-
-    output_text = extract_output_text(data)
-    parsed, parse_error = safe_json_loads(output_text)
-    if parse_error:
-        logger.error("OpenAI text OCR: ошибка парсинга JSON: %s", parse_error)
-        return {}, "Не удалось распознать реквизиты из документа. Попробуйте отправить фото карточки."
-
-    return parsed, ""
+    return parse_company_card(raw_text, source_type="text")
 
 
 def extract_text_from_docx_bytes(file_bytes: bytes) -> str:
@@ -1822,13 +1770,19 @@ def build_dadata_followup_markup() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     markup.add(
         InlineKeyboardButton(
-            "📤 Загрузить карточку предприятия (фото/PDF)",
+            "📤 Загрузить карточку",
             callback_data="upload_carrier_card",
         )
     )
     markup.add(
         InlineKeyboardButton(
-            "⏩ Пропустить реквизиты",
+            "⌨️ Ввести вручную",
+            callback_data="carrier_manual_input",
+        )
+    )
+    markup.add(
+        InlineKeyboardButton(
+            "💾 Сохранить как есть",
             callback_data="skip_carrier_details",
         )
     )
@@ -1988,10 +1942,12 @@ def sync_session_with_carrier_data(session: Dict[str, Any]) -> Dict[str, Any]:
     session["carrier_name"] = carrier_data.get("name", session.get("carrier_name", ""))
     session["carrier_type"] = carrier_data.get("carrier_type", session.get("carrier_type", ""))
     session["inn"] = clean_digits(carrier_data.get("inn", session.get("inn", "")))
+    session["kpp"] = clean_digits(carrier_data.get("kpp", session.get("kpp", "")))
     session["ogrn"] = carrier_data.get("ogrn", session.get("ogrn", ""))
     session["registration_address"] = carrier_data.get("address", session.get("registration_address", ""))
     session["director"] = carrier_data.get("director", session.get("director", ""))
     session["phone"] = normalize_phone(carrier_data.get("phone", session.get("phone", "")))
+    session["phone2"] = normalize_phone(carrier_data.get("phone2", session.get("phone2", "")))
     session["email"] = carrier_data.get("email", session.get("email", ""))
     session["bank"] = carrier_data.get("bank", session.get("bank", ""))
     session["rs"] = clean_digits(carrier_data.get("account", carrier_data.get("rs", session.get("rs", ""))))
@@ -2011,6 +1967,7 @@ def save_carrier_to_sheets(chat_id: int) -> bool:
     session = get_session(chat_id)
     carrier_data = session.get("carrier_data") or {}
     if not carrier_data:
+        logger.error("save_carrier_to_sheets: пустой carrier_data, chat_id=%s", chat_id)
         return False
 
     url = os.getenv("GOOGLE_SCRIPT_URL")
@@ -2018,17 +1975,27 @@ def save_carrier_to_sheets(chat_id: int) -> bool:
         logger.warning("GOOGLE_SCRIPT_URL не задан")
         return False
 
+    payload = {
+        "action": "create_carrier",
+        "carrier_data": carrier_data,
+    }
+
+    logger.info("Отправляю в Apps Script create_carrier, chat_id=%s, payload=%s", chat_id, payload)
+
     try:
         response = requests.post(
             url,
-            json={
-                "action": "create_carrier",
-                "carrier_data": carrier_data,
-            },
+            json=payload,
             timeout=GOOGLE_SCRIPT_TIMEOUT,
         )
         response.raise_for_status()
-        data = response.json()
+        response_text = response.text
+        logger.info("Ответ Apps Script create_carrier (raw): %s", response_text)
+
+        data, parse_error = safe_json_loads(response_text)
+        if parse_error:
+            logger.error("save_carrier_to_sheets: не удалось распарсить JSON: %s", parse_error)
+            return False
     except Exception as e:
         logger.exception("Ошибка сохранения перевозчика в Google Sheets: %s", e)
         return False
@@ -2048,7 +2015,12 @@ def save_carrier_to_sheets(chat_id: int) -> bool:
         save_session(chat_id, session)
         return True
 
-    logger.error("create_carrier: неожиданный ответ Google Script: %s", data)
+    error_message = data.get("error") if isinstance(data, dict) else ""
+    if data.get("ok") is False and error_message:
+        logger.error("create_carrier: Apps Script ошибка: %s", error_message)
+    else:
+        logger.error("create_carrier: неожиданный ответ Google Script: %s", data)
+
     return False
 
 
@@ -2095,18 +2067,27 @@ def merge_extracted_into_carrier_data(session: Dict[str, Any], extracted: Dict[s
 
     mapped = {
         "name": extracted.get("name") or extracted.get("carrier_name", ""),
+        "short_name": extracted.get("carrier_short_name", ""),
         "carrier_type": extracted.get("carrier_type", ""),
-        "inn": extracted.get("inn", ""),
+        "inn": clean_digits(extracted.get("inn", "")),
+        "kpp": clean_digits(extracted.get("kpp", "")),
         "ogrn": extracted.get("ogrn", ""),
+        "snils": clean_digits(extracted.get("snils", "")),
         "address": extracted.get("address") or extracted.get("registration_address", ""),
+        "post_address": extracted.get("post_address", ""),
         "director": extracted.get("director", ""),
+        "basis": extracted.get("basis", ""),
         "phone": normalize_phone(extracted.get("phone", "")),
+        "phone2": normalize_phone(extracted.get("phone2", "")),
         "email": extracted.get("email", "").strip(),
+        "emails": extracted.get("emails", "").strip(),
         "bank": extracted.get("bank", ""),
+        "bank_city": extracted.get("bank_city", ""),
         "account": clean_digits(extracted.get("account") or extracted.get("rs", "")),
         "corr_account": clean_digits(extracted.get("corr_account") or extracted.get("ks", "")),
         "bik": clean_digits(extracted.get("bik", "")),
         "tax_mode": normalize_tax_mode(extracted.get("tax_mode", "")),
+        "edo": extracted.get("edo", ""),
     }
 
     for key, value in mapped.items():
@@ -2329,7 +2310,7 @@ def handle_update_existing_carrier(call):
     session["awaiting_carrier_inn"] = False
     session["awaiting_carrier_card_upload"] = False
     session["awaiting_more_data"] = False
-    session["state"] = "waiting_carrier_phone"
+    session["state"] = "waiting_carrier_flexible_input"
     session = sync_session_with_carrier_data(session)
     save_session(chat_id, session)
 
@@ -2337,9 +2318,8 @@ def handle_update_existing_carrier(call):
     bot.send_message(
         chat_id,
         "🔄 Режим обновления существующего перевозчика.\n\n"
-        f"Текущий телефон: {existing.get('phone', '—') or '—'}\n"
-        "Отправьте новый телефон (если нужно)\n"
-        "или сразу загрузите карточку / нажмите «Пропустить реквизиты».",
+        "Пришлите новые данные в свободном виде (телефон/email/банк/реквизиты)\n"
+        "или загрузите карточку предприятия.",
         reply_markup=build_dadata_followup_markup(),
     )
 
@@ -2382,7 +2362,7 @@ def handle_vehicle_manual_entry(call):
 def handle_upload_carrier_card(call):
     chat_id = call.message.chat.id
     session = get_session(chat_id)
-    session["state"] = "waiting_carrier_bank"
+    session["state"] = "waiting_carrier_flexible_input"
     session["awaiting_carrier_card_upload"] = True
     session["awaiting_carrier_inn"] = False
     save_session(chat_id, session)
@@ -2391,6 +2371,28 @@ def handle_upload_carrier_card(call):
     bot.send_message(
         chat_id,
         "📤 Загрузите карточку предприятия (фото или PDF), я извлеку реквизиты автоматически.",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "carrier_manual_input")
+def handle_carrier_manual_input(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_carrier_flexible_input"
+    session["awaiting_carrier_card_upload"] = False
+    session["awaiting_carrier_inn"] = False
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "⌨️ Отправьте данные в свободном виде (можно одним сообщением):\n"
+        "• телефон\n"
+        "• email\n"
+        "• банк, р/с, к/с, БИК\n"
+        "• режим налогообложения\n\n"
+        "Когда данных достаточно, я сохраню перевозчика автоматически.",
+        reply_markup=build_dadata_followup_markup(),
     )
 
 
@@ -2415,19 +2417,14 @@ def handle_skip_email(call):
     carrier_data["email"] = ""
     session["carrier_data"] = carrier_data
     session["email"] = ""
-    session["state"] = "waiting_carrier_bank"
+    session["state"] = "waiting_carrier_flexible_input"
     save_session(chat_id, session)
 
     bot.answer_callback_query(call.id)
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("📤 Загрузить карточку с реквизитами", callback_data="upload_bank_card"))
-    markup.add(InlineKeyboardButton("⏩ Пропустить", callback_data="skip_bank"))
     bot.send_message(
         chat_id,
-        "📩 Email пропущен.\n\n"
-        "🏦 Пришлите банк, р/с, БИК, к/с и режим налогообложения одним сообщением\n"
-        "или загрузите карточку предприятия:",
-        reply_markup=markup,
+        "📩 Email пропущен. Можно отправить остальные реквизиты в свободном виде или сохранить как есть.",
+        reply_markup=build_dadata_followup_markup(),
     )
 
 
@@ -2435,12 +2432,12 @@ def handle_skip_email(call):
 def handle_upload_bank_card(call):
     chat_id = call.message.chat.id
     session = get_session(chat_id)
-    session["state"] = "waiting_carrier_bank"
+    session["state"] = "waiting_carrier_flexible_input"
     session["awaiting_carrier_card_upload"] = True
     save_session(chat_id, session)
 
     bot.answer_callback_query(call.id)
-    bot.send_message(chat_id, "📤 Загрузите карточку с банковскими реквизитами (фото/PDF).")
+    bot.send_message(chat_id, "📤 Загрузите карточку предприятия (фото/PDF), извлеку реквизиты автоматически.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "skip_bank")
@@ -2584,7 +2581,7 @@ def handle_photo(message):
 
         session = get_session(chat_id)
         state = session.get("state", "")
-        if state in ("waiting_carrier_phone", "waiting_carrier_bank") or session.get("awaiting_carrier_card_upload"):
+        if state in ("waiting_carrier_phone", "waiting_carrier_email", "waiting_carrier_bank", "waiting_carrier_flexible_input") or session.get("awaiting_carrier_card_upload"):
             bot.send_message(chat_id, "⏳ Обрабатываю карточку предприятия...")
             session = merge_extracted_into_carrier_data(session, extracted)
             session["state"] = ""
@@ -2626,7 +2623,7 @@ def handle_document(message):
 
         session = get_session(chat_id)
         state = session.get("state", "")
-        if state in ("waiting_carrier_phone", "waiting_carrier_bank") or session.get("awaiting_carrier_card_upload"):
+        if state in ("waiting_carrier_phone", "waiting_carrier_email", "waiting_carrier_bank", "waiting_carrier_flexible_input") or session.get("awaiting_carrier_card_upload"):
             bot.send_message(chat_id, "⏳ Обрабатываю карточку предприятия...")
             session = merge_extracted_into_carrier_data(session, extracted)
             session["state"] = ""
@@ -2689,75 +2686,89 @@ def handle_text(message):
         session = get_session(chat_id)
         state = session.get("state", "")
 
-        if state == "waiting_carrier_phone":
-            phone = normalize_phone(user_text)
-            if not phone:
-                bot.send_message(chat_id, "❌ Неверный формат. Пример: +7 (924) 530-66-66")
-                return
-
+        if state in ("waiting_carrier_phone", "waiting_carrier_email", "waiting_carrier_bank", "waiting_carrier_flexible_input"):
             carrier_data = session.get("carrier_data") or {}
-            carrier_data["phone"] = phone
-            session["carrier_data"] = carrier_data
-            session["phone"] = phone
-            session["state"] = "waiting_carrier_email"
-            save_session(chat_id, session)
-
-            bot.send_message(
-                chat_id,
-                f"✅ Телефон: {phone}\n\n📧 Отправьте email перевозчика:",
-                reply_markup=_build_skip_markup("skip_email"),
-            )
-            return
-
-        if state == "waiting_carrier_email":
-            email = (user_text or "").strip()
-            if not validate_email(email):
-                bot.send_message(chat_id, "❌ Неверный email")
-                return
-
-            carrier_data = session.get("carrier_data") or {}
-            carrier_data["email"] = email
-            session["carrier_data"] = carrier_data
-            session["email"] = email
-            session["state"] = "waiting_carrier_bank"
-            save_session(chat_id, session)
-
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("📤 Загрузить карточку с реквизитами", callback_data="upload_bank_card"))
-            markup.add(InlineKeyboardButton("⏩ Пропустить", callback_data="skip_bank"))
-            bot.send_message(
-                chat_id,
-                f"✅ Email: {email}\n\n"
-                "🏦 Пришлите банк, р/с, БИК, к/с и режим налогообложения одним сообщением\n"
-                "или загрузите карточку предприятия:",
-                reply_markup=markup,
-            )
-            return
-
-        if state == "waiting_carrier_bank":
             parsed = parse_bulk_reply(user_text, {})
-            carrier_data = session.get("carrier_data") or {}
+            updated_fields: List[str] = []
+
+            phone = normalize_phone(parsed.get("phone", "")) if parsed.get("phone") else ""
+            if not phone:
+                direct_phone = normalize_phone(user_text)
+                if direct_phone:
+                    phone = direct_phone
+
+            if phone:
+                carrier_data["phone"] = phone
+                updated_fields.append("телефон")
+
+            email = (parsed.get("email") or "").strip()
+            if not email:
+                direct_email = (user_text or "").strip()
+                if validate_email(direct_email):
+                    email = direct_email
+            if email and validate_email(email):
+                carrier_data["email"] = email
+                updated_fields.append("email")
 
             if parsed.get("bank"):
                 carrier_data["bank"] = parsed.get("bank")
+                updated_fields.append("банк")
             if parsed.get("rs"):
-                carrier_data["account"] = parsed.get("rs")
+                carrier_data["account"] = clean_digits(parsed.get("rs"))
+                updated_fields.append("р/с")
             if parsed.get("ks"):
-                carrier_data["corr_account"] = parsed.get("ks")
+                carrier_data["corr_account"] = clean_digits(parsed.get("ks"))
+                updated_fields.append("к/с")
             if parsed.get("bik"):
-                carrier_data["bik"] = parsed.get("bik")
+                carrier_data["bik"] = clean_digits(parsed.get("bik"))
+                updated_fields.append("БИК")
             if parsed.get("tax_mode"):
-                carrier_data["tax_mode"] = parsed.get("tax_mode")
+                carrier_data["tax_mode"] = normalize_tax_mode(parsed.get("tax_mode"))
+                updated_fields.append("налогообложение")
+            if parsed.get("carrier_name") and not carrier_data.get("name"):
+                carrier_data["name"] = parsed.get("carrier_name")
+                updated_fields.append("название")
+            if parsed.get("inn"):
+                carrier_data["inn"] = clean_digits(parsed.get("inn"))
+                updated_fields.append("ИНН")
+            if parsed.get("ogrn"):
+                carrier_data["ogrn"] = parsed.get("ogrn")
+                updated_fields.append("ОГРН")
+            if parsed.get("registration_address"):
+                carrier_data["address"] = parsed.get("registration_address")
+                updated_fields.append("адрес")
 
-            if not carrier_data.get("bank"):
+            if not updated_fields:
                 bot.send_message(
                     chat_id,
-                    "❌ Не вижу название банка. Пришлите банк, р/с, БИК, к/с и режим налогообложения одним сообщением.",
-                    reply_markup=_build_skip_markup("skip_bank"),
+                    "Не распознал новые реквизиты в сообщении. "
+                    "Отправьте телефон/email или загрузите карточку предприятия.",
+                    reply_markup=build_dadata_followup_markup(),
                 )
                 return
 
             session["carrier_data"] = carrier_data
+            session["state"] = "waiting_carrier_flexible_input"
+            session = sync_session_with_carrier_data(session)
+            save_session(chat_id, session)
+
+            missing_required = []
+            if not carrier_data.get("phone"):
+                missing_required.append("телефон")
+            if not carrier_data.get("email"):
+                missing_required.append("email")
+
+            if missing_required:
+                bot.send_message(
+                    chat_id,
+                    "✅ Обновил: " + ", ".join(sorted(set(updated_fields))) + "\n\n"
+                    "Ещё нужно: " + ", ".join(missing_required) + ".\n"
+                    "Можно отправить одним сообщением или загрузить карточку.",
+                    reply_markup=build_dadata_followup_markup(),
+                )
+                return
+
+            bot.send_message(chat_id, "✅ Данных достаточно. Сохраняю перевозчика в Google Sheets...")
             session["state"] = ""
             save_session(chat_id, session)
             finalize_carrier_profile(chat_id)
@@ -2877,7 +2888,7 @@ def handle_text(message):
                 return
 
             session["carrier_data"] = carrier_data
-            session["state"] = "waiting_carrier_phone"
+            session["state"] = "waiting_carrier_flexible_input"
             session["awaiting_carrier_inn"] = False
             session["awaiting_carrier_card_upload"] = False
             session["awaiting_more_data"] = False
@@ -2886,9 +2897,9 @@ def handle_text(message):
 
             bot.send_message(
                 chat_id,
-                "✅ Основные данные получены!\n\n"
-                "📞 Отправьте телефон перевозчика\n"
-                "или загрузите карточку предприятия с реквизитами:",
+                "✅ Основные данные получены из DaData!\n\n"
+                "📤 Загрузите карточку предприятия с реквизитами (фото или PDF)\n\n"
+                "Или отправьте телефон и email текстом.",
                 reply_markup=build_dadata_followup_markup(),
             )
             return
@@ -3074,28 +3085,17 @@ def handle_text(message):
                     "bik": session_data.get("bik", ""),
                 }
                 session_data["carrier_data"] = carrier_data
-                if not session_data.get("phone"):
-                    session_data["state"] = "waiting_carrier_phone"
-                    session_data["awaiting_more_data"] = False
-                    save_session(chat_id, session_data)
-                    bot.send_message(
-                        chat_id,
-                        "✅ Основные данные получены!\n\n"
-                        "📞 Отправьте телефон перевозчика\n"
-                        "или загрузите карточку предприятия с реквизитами:",
-                        reply_markup=build_dadata_followup_markup(),
-                    )
-                    return
-                if not session_data.get("email"):
-                    session_data["state"] = "waiting_carrier_email"
-                    session_data["awaiting_more_data"] = False
-                    save_session(chat_id, session_data)
-                    bot.send_message(
-                        chat_id,
-                        "✅ Телефон уже есть.\n\n📧 Отправьте email перевозчика:",
-                        reply_markup=_build_skip_markup("skip_email"),
-                    )
-                    return
+                session_data["state"] = "waiting_carrier_flexible_input"
+                session_data["awaiting_more_data"] = False
+                save_session(chat_id, session_data)
+                bot.send_message(
+                    chat_id,
+                    "✅ Основные данные получены из DaData!\n\n"
+                    "📤 Загрузите карточку предприятия с реквизитами (фото или PDF)\n\n"
+                    "Или отправьте телефон и email текстом.",
+                    reply_markup=build_dadata_followup_markup(),
+                )
+                return
 
             if not session_data.get("inn") and not session_data.get("carrier_name"):
                 show_carrier_add_options(message)
