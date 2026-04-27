@@ -108,6 +108,16 @@ def load_config() -> Dict[str, Any]:
 CONFIG = load_config()
 CUSTOMERS = CONFIG.get("customers", [])
 
+VALID_TAX_MODES = ("ОСНО", "УСН", "Патент", "Самозанятый")
+TAX_MODE_PROMPT = "налогообложение (ОСНО / УСН / Патент / Самозанятый)"
+TAX_MODE_HINTS = (
+    "Подсказка по налогообложению:\n"
+    "• ОСНО — общая система с НДС\n"
+    "• УСН — упрощенная, без НДС\n"
+    "• Патент — для ИП\n"
+    "• Самозанятый — НПД"
+)
+
 # =========================
 # ПРОСТОЕ ХРАНЕНИЕ СЕССИЙ
 # =========================
@@ -192,6 +202,12 @@ def validate_session_fields(session: Dict[str, Any]) -> Dict[str, str]:
     if ks and not validate_account_20(ks):
         errors["ks"] = "Корреспондентский счет должен содержать 20 цифр"
 
+    tax_mode = session.get("tax_mode", "")
+    if tax_mode and tax_mode not in VALID_TAX_MODES:
+        errors["tax_mode"] = (
+            "Укажите один из вариантов: ОСНО, УСН, Патент или Самозанятый"
+        )
+
     return errors
 
 
@@ -203,6 +219,7 @@ def format_validation_errors_for_user(errors: Dict[str, str]) -> str:
         "bik": "БИК",
         "rs": "расчетный счет",
         "ks": "корр. счет",
+        "tax_mode": "налогообложение",
     }
 
     lines = ["Проверьте, пожалуйста, данные:"]
@@ -370,6 +387,17 @@ SYSTEM_PROMPT = """
 - fuel_amount
 - fuel_liters
 
+Для поля tax_mode используй ТОЛЬКО один из вариантов:
+- ОСНО
+- УСН
+- Патент
+- Самозанятый
+
+Сопоставление синонимов для tax_mode:
+- "с НДС" => "ОСНО"
+- "без НДС" или "упрощенка" => "УСН"
+- "НПД" => "Самозанятый"
+
 Правила определения сценария:
 
 1) new_carrier_contract
@@ -467,7 +495,7 @@ SYSTEM_PROMPT = """
     "inn": "381234567890"
   },
   "missing": ["customer_name", "phone", "email", "bank", "rs", "bik", "ks", "tax_mode"],
-  "next_question": "Укажите заказчика, телефон, email, банк, расчетный счет, БИК, корр. счет и налогообложение."
+  "next_question": "Укажите заказчика, телефон, email, банк, расчетный счет, БИК, корр. счет и налогообложение (ОСНО / УСН / Патент / Самозанятый)."
 }
 
 Если сценарий неясен, верни:
@@ -675,7 +703,8 @@ def enrich_result_with_dadata(result: Dict[str, Any]) -> Tuple[Dict[str, Any], s
         result["next_question"] = (
             "Нашёл данные по ИНН.\n"
             "Пришлите одним сообщением:\n"
-            "заказчик, телефон, email, банк, расчетный счет, БИК, корр. счет, налогообложение."
+            f"заказчик, телефон, email, банк, расчетный счет, БИК, корр. счет, {TAX_MODE_PROMPT}.\n\n"
+            f"{TAX_MODE_HINTS}"
         )
 
     return result, ""
@@ -803,18 +832,22 @@ def format_router_result(result: Dict[str, Any]) -> str:
 
 
 def normalize_tax_mode(text: str) -> str:
-    t = (text or "").lower()
+    t = (text or "").strip().lower()
 
-    if "без ндс" in t:
-        return "без НДС"
-    if "с ндс" in t:
-        return "с НДС"
-    if "самозан" in t:
-        return "самозанятый"
+    if not t:
+        return ""
+
+    if "самозан" in t or "нпд" in t:
+        return "Самозанятый"
+
     if "патент" in t:
-        return "патент"
-    if "нпд" in t:
-        return "НПД"
+        return "Патент"
+
+    if "осно" in t or "с ндс" in t:
+        return "ОСНО"
+
+    if "усн" in t or "упрощ" in t or "без ндс" in t:
+        return "УСН"
 
     return ""
 
@@ -989,7 +1022,7 @@ def parse_bulk_reply(text: str, session: Dict[str, Any]) -> Dict[str, Any]:
         parsed["email"] = email
 
     tax_mode = normalize_tax_mode(text)
-    if tax_mode and not parsed.get("tax_mode"):
+    if tax_mode:
         parsed["tax_mode"] = tax_mode
 
     bank = detect_bank_name(text)
@@ -1030,12 +1063,17 @@ def format_missing_for_user(missing: List[str]) -> str:
         "rs": "расчетный счет",
         "bik": "БИК",
         "ks": "корр. счет",
-        "tax_mode": "налогообложение (с НДС / без НДС / патент / самозанятый)",
+        "tax_mode": TAX_MODE_PROMPT,
     }
 
     lines = ["Не хватает:"]
     for item in missing:
         lines.append(f"• {labels.get(item, item)}")
+
+    if "tax_mode" in missing:
+        lines.append("")
+        lines.append(TAX_MODE_HINTS)
+
     return "\n".join(lines)
 
 
@@ -1219,6 +1257,8 @@ def handle_text(message):
                 session["ks"] = clean_digits(session.get("ks", ""))
             if session.get("phone"):
                 session["phone"] = normalize_phone(session.get("phone", ""))
+            if session.get("tax_mode"):
+                session["tax_mode"] = normalize_tax_mode(session.get("tax_mode", ""))
 
             save_session(chat_id, session)
 
@@ -1252,7 +1292,7 @@ def handle_text(message):
                 "rs": session.get("rs", ""),
                 "bik": session.get("bik", ""),
                 "ks": session.get("ks", ""),
-                "tax_mode": session.get("tax_mode", ""),
+                "tax_mode": normalize_tax_mode(session.get("tax_mode", "")),
             }
 
             gs_result, gs_error = call_google_script(payload)
@@ -1298,6 +1338,9 @@ def handle_text(message):
                 bot.send_message(chat_id, "ИНН должен содержать 10 или 12 цифр. Уточните ИНН.")
                 return
 
+        if known.get("tax_mode"):
+            known["tax_mode"] = normalize_tax_mode(known.get("tax_mode", ""))
+
         result["known"] = known
 
         result, dadata_error = enrich_result_with_dadata(result)
@@ -1327,7 +1370,7 @@ def handle_text(message):
                 "rs": clean_digits(known.get("rs", "")),
                 "bik": clean_digits(known.get("bik", "")),
                 "ks": clean_digits(known.get("ks", "")),
-                "tax_mode": known.get("tax_mode", ""),
+                "tax_mode": normalize_tax_mode(known.get("tax_mode", "")),
                 "director": known.get("director", ""),
             }
 
