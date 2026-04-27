@@ -3,12 +3,14 @@ import json
 import re
 import base64
 import logging
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
 import requests
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
 # =========================
@@ -70,56 +72,116 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 # =========================
 
 DEFAULT_CONFIG = {
-    "customers": [
-        {
-            "name": "ООО Фрукт Сервис",
-            "code": "FRUKT_SERVICE",
-            "aliases": ["фрукт сервис", "ооо фрукт сервис", "фруктсервис"],
-        },
-        {
-            "name": "ИП Галанина",
-            "code": "GALANINA_IP",
-            "aliases": ["галанин", "галина", "ип галанина"],
-        },
-    ]
+    "customers": []
 }
 
 
 def load_config() -> Dict[str, Any]:
     if not CONFIG_PATH.exists():
         logger.warning("config.json не найден, использую дефолтный конфиг")
-        return DEFAULT_CONFIG
+        return dict(DEFAULT_CONFIG)
 
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             config = json.load(f)
 
-        if not isinstance(config, dict) or "customers" not in config:
+        if not isinstance(config, dict):
             logger.warning("config.json имеет неверный формат, использую дефолтный конфиг")
-            return DEFAULT_CONFIG
+            return dict(DEFAULT_CONFIG)
 
+        config.setdefault("customers", [])
         logger.info("Конфиг заказчиков загружен из %s", CONFIG_PATH)
         return config
     except Exception as e:
         logger.exception("Ошибка чтения config.json: %s", e)
-        return DEFAULT_CONFIG
+        return dict(DEFAULT_CONFIG)
 
 
 CONFIG = load_config()
-CUSTOMERS = CONFIG.get("customers", [])
+CUSTOMERS_CACHE_TTL_SECONDS = 300
+_CUSTOMERS_CACHE: Dict[str, Any] = {"items": [], "updated_at": 0.0}
+
+
+def _normalize_customers(customers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized = []
+    for customer in customers or []:
+        if not isinstance(customer, dict):
+            continue
+
+        code = str(customer.get("code", "")).strip()
+        name = str(customer.get("name", "")).strip()
+        if not code or not name:
+            continue
+
+        normalized_customer = dict(customer)
+        normalized_customer["code"] = code
+        normalized_customer["name"] = name
+        normalized_customer["aliases"] = normalized_customer.get("aliases") or []
+        normalized.append(normalized_customer)
+
+    return normalized
+
+
+def get_customers_list(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Получить список заказчиков из Google Sheets через Apps Script."""
+    cache_age = time.time() - float(_CUSTOMERS_CACHE.get("updated_at", 0.0) or 0.0)
+    if not force_refresh and _CUSTOMERS_CACHE.get("items") and cache_age < CUSTOMERS_CACHE_TTL_SECONDS:
+        return _CUSTOMERS_CACHE["items"]
+
+    url = os.getenv("GOOGLE_SCRIPT_URL")
+    if not url:
+        logger.warning("GOOGLE_SCRIPT_URL не задан: список заказчиков берется из локального config.json")
+        fallback_customers = _normalize_customers(CONFIG.get("customers", []))
+        _CUSTOMERS_CACHE["items"] = fallback_customers
+        _CUSTOMERS_CACHE["updated_at"] = time.time()
+        return fallback_customers
+
+    try:
+        response = requests.post(
+            url,
+            json={"action": "get_customers"},
+            timeout=GOOGLE_SCRIPT_TIMEOUT,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        payload = data
+
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), dict):
+            payload = data.get("result")
+
+        if isinstance(payload, dict) and payload.get("success"):
+            customers = _normalize_customers(payload.get("customers", []))
+            _CUSTOMERS_CACHE["items"] = customers
+            _CUSTOMERS_CACHE["updated_at"] = time.time()
+            return customers
+
+        logger.error("Apps Script get_customers: неожиданный ответ: %s", data)
+    except Exception as e:
+        logger.error("Ошибка получения заказчиков: %s", e)
+
+    fallback_customers = _normalize_customers(CONFIG.get("customers", []))
+    _CUSTOMERS_CACHE["items"] = fallback_customers
+    _CUSTOMERS_CACHE["updated_at"] = time.time()
+    return fallback_customers
+
+
+def get_customers_from_sheets(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Совместимое имя функции для получения списка заказчиков из Google Sheets."""
+    return get_customers_list(force_refresh=force_refresh)
 
 
 def get_customer_by_code(code: str) -> dict:
     """Получить полные реквизиты заказчика по коду."""
-    for c in CUSTOMERS:
-        if c.get("code", "").upper() == code.upper():
+    for c in get_customers_list():
+        if c.get("code", "").upper() == (code or "").upper():
             return c
     return {}
 
 
 def get_customer_by_inn(inn: str) -> dict:
     """Получить заказчика по ИНН."""
-    for c in CUSTOMERS:
+    for c in get_customers_list():
         if c.get("inn") == inn:
             return c
     return {}
@@ -128,7 +190,7 @@ def get_customer_by_inn(inn: str) -> dict:
 def get_customer_by_alias(text: str) -> dict:
     """Найти заказчика по алиасу или имени."""
     t = (text or "").lower().strip()
-    for c in CUSTOMERS:
+    for c in get_customers_list():
         name = (c.get("name") or "").lower()
         if name and name in t:
             return c
@@ -140,13 +202,14 @@ def get_customer_by_alias(text: str) -> dict:
 
 def format_customer_choice() -> str:
     """Сформировать меню выбора заказчика."""
-    if len(CUSTOMERS) == 0:
-        return "Заказчиков нет в базе. Добавьте через config.json."
-    if len(CUSTOMERS) == 1:
-        c = CUSTOMERS[0]
+    customers = get_customers_list()
+    if len(customers) == 0:
+        return "Заказчиков нет в базе. Нажмите '➕ Добавить нового заказчика'."
+    if len(customers) == 1:
+        c = customers[0]
         return f"Заказчик: {c.get('name', '?')} (ИНН: {c.get('inn', '?')})"
-    lines = ["Выберите заказчика (номер или название):"]
-    for i, c in enumerate(CUSTOMERS, 1):
+    lines = ["Выберите заказчика:"]
+    for i, c in enumerate(customers, 1):
         inn = c.get("inn", "")
         inn_str = f" (ИНН: {inn})" if inn else ""
         lines.append(f"{i}. {c.get('name', '?')}{inn_str}")
@@ -158,8 +221,10 @@ def auto_select_customer(session: dict) -> bool:
     Возвращает True если заказчик выбран."""
     if session.get("customer_name"):
         return True
-    if len(CUSTOMERS) == 1:
-        c = CUSTOMERS[0]
+
+    customers = get_customers_list()
+    if len(customers) == 1:
+        c = customers[0]
         session["customer_name"] = c.get("name", "")
         session["customer_code"] = c.get("code", "")
         session["customer_data"] = c
@@ -760,17 +825,20 @@ def enrich_result_with_dadata(result: Dict[str, Any]) -> Tuple[Dict[str, Any], s
 
     if result.get("scenario") == "new_carrier_contract":
         # Автовыбор заказчика
-        if len(CUSTOMERS) == 1:
-            c = CUSTOMERS[0]
+        customers = get_customers_list()
+        if len(customers) == 1:
+            c = customers[0]
             known["customer_name"] = c.get("name", "")
+            known["customer_code"] = c.get("code", "")
+            known["customer_data"] = c
             result["known"] = known
             if "customer_name" in result.get("missing", []):
                 result["missing"].remove("customer_name")
             customer_info = f"Заказчик: {c.get('name', '')} (автоматически)\n"
-        elif len(CUSTOMERS) > 1:
-            customer_info = format_customer_choice() + "\n"
+        elif len(customers) > 1:
+            customer_info = "Выберите заказчика кнопкой ниже.\n"
         else:
-            customer_info = ""
+            customer_info = "Заказчики пока не найдены. Используйте кнопку добавления нового заказчика ниже.\n"
         
         remaining = [f for f in result.get("missing", []) if f != "customer_name"]
         if remaining:
@@ -966,7 +1034,7 @@ def extract_bik(text: str) -> str:
 
 def detect_customer_name(text: str) -> str:
     t = (text or "").lower()
-    for customer in CUSTOMERS:
+    for customer in get_customers_list():
         aliases = customer.get("aliases", []) or []
         name = customer.get("name", "")
         normalized_aliases = [a.lower() for a in aliases]
@@ -982,14 +1050,13 @@ def detect_customer_name(text: str) -> str:
 
 
 def detect_customer_code(customer_name: str) -> str:
-    t = (customer_name or "").lower()
-    for customer in CUSTOMERS:
-        name = (customer.get("name") or "").lower()
+    t = (customer_name or "").lower().strip()
+    for customer in get_customers_list():
+        name = (customer.get("name") or "").lower().strip()
         if name and name == t:
-            return customer.get("code", "FRUKT_SERVICE")
+            return customer.get("code", "")
 
-    # fallback в случае отсутствия явного совпадения
-    return "FRUKT_SERVICE"
+    return ""
 
 
 def detect_bank_name(text: str) -> str:
@@ -1210,6 +1277,56 @@ def safe_json_loads(output_text: str) -> Tuple[Dict[str, Any], str]:
     return data, ""
 
 
+def build_add_customer_markup() -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📄 Загрузить карточку DOCX", callback_data="upload_card"))
+    markup.add(
+        InlineKeyboardButton(
+            "📝 Заполнить Google Форму",
+            url="https://script.google.com/macros/s/AKfycbwQkC2kc8V9oD1fn7Ug8cLUGqnw8S0ZuCFIkBgRZcr1V3dNeFRV-JFAPOt45DBP5p-z/exec?page=customer",
+        )
+    )
+    markup.add(InlineKeyboardButton("⌨️ Ввести ИНН", callback_data="enter_inn_customer"))
+    return markup
+
+
+def show_customer_selection(chat_id: int, force_refresh: bool = False):
+    customers = get_customers_list(force_refresh=force_refresh)
+    markup = InlineKeyboardMarkup()
+
+    for customer in customers:
+        btn = InlineKeyboardButton(
+            text=customer.get("name", "Без названия"),
+            callback_data=f"select_customer_{customer.get('code', '')}",
+        )
+        markup.add(btn)
+
+    markup.add(
+        InlineKeyboardButton(
+            text="➕ Добавить нового заказчика",
+            callback_data="add_new_customer",
+        )
+    )
+
+    bot.send_message(chat_id, "Выберите заказчика:", reply_markup=markup)
+
+
+def prompt_for_missing_after_customer(chat_id: int, session: Dict[str, Any]):
+    still_missing = [f for f in missing_session_fields(session) if f != "customer_name"]
+    validation_errors = validate_session_fields(session)
+
+    if still_missing or validation_errors:
+        messages = []
+        if validation_errors:
+            messages.append(format_validation_errors_for_user(validation_errors))
+        if still_missing:
+            messages.append(format_missing_for_user(still_missing))
+        messages.append("\nПришлите корректные/недостающие данные одним сообщением.")
+        bot.send_message(chat_id, "\n\n".join(messages))
+    else:
+        bot.send_message(chat_id, "Заказчик выбран. Все обязательные данные уже собраны, создаю договор...")
+
+
 # =========================
 # TELEGRAM
 # =========================
@@ -1236,6 +1353,64 @@ def handle_start(message):
 def handle_reset(message):
     clear_session(message.chat.id)
     bot.send_message(message.chat.id, "Сессия очищена.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("select_customer_"))
+def handle_customer_selection(call):
+    chat_id = call.message.chat.id
+    customer_code = call.data.replace("select_customer_", "", 1)
+
+    session = get_session(chat_id)
+    customer = get_customer_by_code(customer_code)
+
+    if not customer:
+        for item in get_customers_list(force_refresh=True):
+            if item.get("code", "").upper() == customer_code.upper():
+                customer = item
+                break
+
+    if not customer:
+        bot.answer_callback_query(call.id, "Не удалось найти заказчика, обновляю список")
+        show_customer_selection(chat_id, force_refresh=True)
+        return
+
+    session["customer_name"] = customer.get("name", "")
+    session["customer_code"] = customer.get("code", "")
+    session["customer_data"] = customer
+    session["awaiting_customer_inn"] = False
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, f"Выбран: {customer.get('name', 'заказчик')}")
+    bot.send_message(chat_id, f"✅ Заказчик выбран: {customer.get('name', '—')}")
+
+    if session.get("scenario") == "new_carrier_contract" and session.get("awaiting_more_data"):
+        prompt_for_missing_after_customer(chat_id, session)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "add_new_customer")
+def handle_add_customer(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "Как добавить заказчика?", reply_markup=build_add_customer_markup())
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "upload_card")
+def handle_upload_card(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "Отправьте карточку заказчика (фото или файл), я попробую извлечь реквизиты."
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "enter_inn_customer")
+def handle_enter_inn_customer(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["awaiting_customer_inn"] = True
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "Введите ИНН заказчика (10 или 12 цифр).")
 
 
 @bot.message_handler(content_types=["photo"])
@@ -1316,6 +1491,9 @@ def handle_photo(message):
 
         bot.send_message(chat_id, "\n".join(lines))
 
+        if "customer_name" in missing and not session.get("customer_name"):
+            show_customer_selection(chat_id)
+
     except Exception as e:
         logger.exception("Ошибка в handle_photo: %s", e)
         bot.send_message(
@@ -1335,6 +1513,34 @@ def handle_text(message):
 
     try:
         session = get_session(chat_id)
+
+        if session.get("awaiting_customer_inn"):
+            inn = clean_digits(user_text)
+            if not validate_inn(inn):
+                bot.send_message(chat_id, "ИНН заказчика должен содержать 10 или 12 цифр. Попробуйте снова.")
+                return
+
+            customer = get_customer_by_inn(inn)
+            if not customer:
+                session["awaiting_customer_inn"] = False
+                save_session(chat_id, session)
+                bot.send_message(
+                    chat_id,
+                    "Заказчик с таким ИНН не найден в Google Sheets. Можно добавить нового заказчика через кнопку ниже.",
+                    reply_markup=build_add_customer_markup(),
+                )
+                return
+
+            session["customer_name"] = customer.get("name", "")
+            session["customer_code"] = customer.get("code", "")
+            session["customer_data"] = customer
+            session["awaiting_customer_inn"] = False
+            save_session(chat_id, session)
+
+            bot.send_message(chat_id, f"✅ Заказчик выбран: {customer.get('name', '—')}")
+            if session.get("scenario") == "new_carrier_contract" and session.get("awaiting_more_data"):
+                prompt_for_missing_after_customer(chat_id, session)
+            return
 
         # Если уже ждём доп.данные по новому перевозчику
         if session.get("scenario") == "new_carrier_contract" and session.get("awaiting_more_data"):
@@ -1368,17 +1574,17 @@ def handle_text(message):
                 messages.append("\nПришлите корректные/недостающие данные одним сообщением.")
 
                 bot.send_message(chat_id, "\n\n".join(messages))
+                if "customer_name" in still_missing and not session.get("customer_name"):
+                    show_customer_selection(chat_id)
                 return
 
             # Получаем полные данные заказчика
             cust = session.get("customer_data") or get_customer_by_alias(session.get("customer_name", ""))
-            if not cust:
-                cust = get_customer_by_code("FRUKT_SERVICE")
-            
+
             payload = {
                 "action": "create_carrier_and_contract",
                 "customer_name": cust.get("name", session.get("customer_name", "")),
-                "customer_code": cust.get("code", detect_customer_code(session.get("customer_name", ""))),
+                "customer_code": cust.get("code", session.get("customer_code") or detect_customer_code(session.get("customer_name", ""))),
                 "customer_inn": cust.get("inn", ""),
                 "customer_kpp": cust.get("kpp", ""),
                 "customer_director": cust.get("director", ""),
@@ -1470,6 +1676,8 @@ def handle_text(message):
                 "scenario": "new_carrier_contract",
                 "awaiting_more_data": True,
                 "customer_name": known.get("customer_name", ""),
+                "customer_code": known.get("customer_code", ""),
+                "customer_data": known.get("customer_data", {}),
                 "carrier_name": known.get("carrier_name", ""),
                 "carrier_type": known.get("carrier_type", ""),
                 "inn": clean_digits(known.get("inn", "")),
@@ -1490,6 +1698,9 @@ def handle_text(message):
                 bot.send_message(chat_id, format_validation_errors_for_user(validation_errors))
 
             save_session(chat_id, session_data)
+
+            if not session_data.get("customer_name"):
+                show_customer_selection(chat_id)
 
     except Exception as e:
         logger.exception("Ошибка в handle_text: %s", e)
