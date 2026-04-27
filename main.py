@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import io
+import zipfile
 import base64
 import logging
 import time
@@ -12,6 +14,11 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
+
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover
+    PdfReader = None
 
 # =========================
 # КОНСТАНТЫ И ЛОГИРОВАНИЕ
@@ -781,6 +788,109 @@ def extract_card_data_from_image(image_bytes: bytes) -> Tuple[Dict[str, Any], st
     return parsed, ""
 
 
+def extract_card_data_from_text(raw_text: str) -> Tuple[Dict[str, Any], str]:
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY не задан")
+        return {}, "Сервис OpenAI не настроен (нет API-ключа)."
+
+    text = (raw_text or "").strip()
+    if not text:
+        return {}, "Не удалось извлечь текст из документа."
+
+    prompt = (
+        "Ты извлекаешь реквизиты перевозчика из текста карточки компании. "
+        "Верни строго JSON (без markdown и пояснений).\n\n"
+        "Если поле не найдено — верни пустую строку.\n"
+        "Поля JSON: carrier_name, carrier_short_name, carrier_type, inn, ogrn, registration_address, "
+        "phone, email, bank, bank_city, rs, ks, bik, director.\n"
+        "Правила: carrier_type только ИП/ООО/САМОЗАНЯТЫЙ."
+    )
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_text", "text": f"Текст карточки:\n{text[:12000]}"},
+                ],
+            }
+        ],
+        "store": False,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    data, error = post_json_with_handling(
+        url="https://api.openai.com/v1/responses",
+        payload=payload,
+        headers=headers,
+        timeout=OPENAI_ROUTER_TIMEOUT,
+        source="OpenAI Text OCR",
+    )
+    if error:
+        return {}, error
+
+    output_text = extract_output_text(data)
+    parsed, parse_error = safe_json_loads(output_text)
+    if parse_error:
+        logger.error("OpenAI text OCR: ошибка парсинга JSON: %s", parse_error)
+        return {}, "Не удалось распознать реквизиты из документа. Попробуйте отправить фото карточки."
+
+    return parsed, ""
+
+
+def extract_text_from_docx_bytes(file_bytes: bytes) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            document_xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+    except Exception as e:
+        logger.exception("DOCX parse error: %s", e)
+        return ""
+
+    text = re.sub(r"<[^>]+>", " ", document_xml)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
+    if PdfReader is None:
+        logger.warning("pypdf не установлен, PDF-парсинг недоступен")
+        return ""
+
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        pages_text = []
+        for page in reader.pages[:15]:
+            pages_text.append(page.extract_text() or "")
+        return "\n".join(pages_text).strip()
+    except Exception as e:
+        logger.exception("PDF parse error: %s", e)
+        return ""
+
+
+def extract_card_data_from_document(file_bytes: bytes, mime_type: str, file_name: str) -> Tuple[Dict[str, Any], str]:
+    mime = (mime_type or "").lower()
+    name = (file_name or "").lower()
+
+    raw_text = ""
+    if "wordprocessingml.document" in mime or name.endswith(".docx"):
+        raw_text = extract_text_from_docx_bytes(file_bytes)
+    elif "pdf" in mime or name.endswith(".pdf"):
+        raw_text = extract_text_from_pdf_bytes(file_bytes)
+    elif name.endswith(".txt"):
+        raw_text = file_bytes.decode("utf-8", errors="ignore")
+
+    if not raw_text:
+        return {}, "Не удалось извлечь текст из файла. Отправьте фото карточки или DOCX/PDF с текстом."
+
+    return extract_card_data_from_text(raw_text)
+
+
 # =========================
 # ОБОГАЩЕНИЕ РЕЗУЛЬТАТА DADATA
 # =========================
@@ -1290,6 +1400,43 @@ def build_add_customer_markup() -> InlineKeyboardMarkup:
     return markup
 
 
+def build_add_carrier_markup() -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(
+            text="📄 Загрузить карточку компании (DOCX/PDF)",
+            callback_data="carrier_upload_card",
+        )
+    )
+    markup.add(
+        InlineKeyboardButton(
+            text="📝 Заполнить Google Форму",
+            url="https://script.google.com/macros/s/AKfycbwQkC2kc8V9oD1fn7Ug8cLUGqnw8S0ZuCFIkBgRZcr1V3dNeFRV-JFAPOt45DBP5p-z/exec?page=carrier",
+        )
+    )
+    markup.add(
+        InlineKeyboardButton(
+            text="⌨️ Ввести ИНН (автозаполнение DaData)",
+            callback_data="carrier_enter_inn",
+        )
+    )
+    return markup
+
+
+def show_carrier_add_options(message):
+    """Показать варианты добавления перевозчика"""
+    bot.send_message(
+        message.chat.id,
+        "📋 Как вы хотите добавить перевозчика?\n\n"
+        "• Google Форма — самый удобный способ, все поля в одном месте\n"
+        "• ИНН — быстрое добавление с автозаполнением из базы DaData\n"
+        "• Карточка — загрузите готовый документ компании\n\n"
+        "После заполнения Google Формы вернитесь в бот и нажмите /refresh_carriers "
+        "или сразу отправьте команду с ИНН/названием перевозчика.",
+        reply_markup=build_add_carrier_markup(),
+    )
+
+
 def show_customer_selection(chat_id: int, force_refresh: bool = False):
     customers = get_customers_list(force_refresh=force_refresh)
     markup = InlineKeyboardMarkup()
@@ -1327,6 +1474,71 @@ def prompt_for_missing_after_customer(chat_id: int, session: Dict[str, Any]):
         bot.send_message(chat_id, "Заказчик выбран. Все обязательные данные уже собраны, создаю договор...")
 
 
+def apply_extracted_carrier_data(chat_id: int, extracted: Dict[str, Any], source_hint: str):
+    session = get_session(chat_id)
+    session["scenario"] = "new_carrier_contract"
+    session["awaiting_more_data"] = True
+    session["awaiting_carrier_inn"] = False
+    session["awaiting_carrier_card_upload"] = False
+
+    session["carrier_name"] = extracted.get("carrier_name", "")
+    session["carrier_type"] = extracted.get("carrier_type", "") or detect_legal_form_from_name(
+        extracted.get("carrier_name", "")
+    )
+    session["inn"] = clean_digits(extracted.get("inn", ""))
+    session["ogrn"] = extracted.get("ogrn", "")
+    session["registration_address"] = extracted.get("registration_address", "")
+    session["phone"] = normalize_phone(extracted.get("phone", ""))
+    session["email"] = extracted.get("email", "")
+    session["bank"] = extracted.get("bank", "")
+    session["rs"] = clean_digits(extracted.get("rs", ""))
+    session["ks"] = clean_digits(extracted.get("ks", ""))
+    session["bik"] = clean_digits(extracted.get("bik", ""))
+    session["director"] = extracted.get("director", "")
+    session["customer_name"] = session.get("customer_name", "")
+    session["tax_mode"] = session.get("tax_mode", "")
+
+    save_session(chat_id, session)
+
+    lines = [f"Нашёл по карточке ({source_hint}):"]
+    for key, label in [
+        ("carrier_name", "Название"),
+        ("carrier_type", "Тип"),
+        ("inn", "ИНН"),
+        ("ogrn", "ОГРН / ОГРНИП"),
+        ("registration_address", "Адрес"),
+        ("phone", "Телефон"),
+        ("email", "Email"),
+        ("bank", "Банк"),
+        ("rs", "Расчетный счет"),
+        ("ks", "Корр. счет"),
+        ("bik", "БИК"),
+    ]:
+        value = session.get(key, "")
+        if value:
+            lines.append(f"• {label}: {value}")
+
+    validation_errors = validate_session_fields(session)
+    if validation_errors:
+        lines.append("")
+        lines.append(format_validation_errors_for_user(validation_errors))
+
+    missing = missing_session_fields(session)
+    if missing:
+        lines.append("")
+        lines.append(format_missing_for_user(missing))
+        lines.append("")
+        lines.append("Пришлите недостающие данные одним сообщением.")
+    else:
+        lines.append("")
+        lines.append("Данных достаточно для создания договора.")
+
+    bot.send_message(chat_id, "\n".join(lines))
+
+    if "customer_name" in missing and not session.get("customer_name"):
+        show_customer_selection(chat_id)
+
+
 # =========================
 # TELEGRAM
 # =========================
@@ -1353,6 +1565,25 @@ def handle_start(message):
 def handle_reset(message):
     clear_session(message.chat.id)
     bot.send_message(message.chat.id, "Сессия очищена.")
+
+
+@bot.message_handler(commands=["refresh_carriers"])
+def handle_refresh_carriers(message):
+    chat_id = message.chat.id
+    session = get_session(chat_id)
+    session["awaiting_carrier_card_upload"] = False
+    session["awaiting_carrier_inn"] = False
+    save_session(chat_id, session)
+
+    bot.send_message(
+        chat_id,
+        "🔄 Обновил контекст по перевозчикам.\n"
+        "Если вы уже заполнили Google Форму, продолжите командой вида:\n"
+        "`Сделай договор новый перевозчик ИНН ...`\n"
+        "или выберите способ добавления ниже.",
+        parse_mode="Markdown",
+        reply_markup=build_add_carrier_markup(),
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("select_customer_"))
@@ -1413,6 +1644,41 @@ def handle_enter_inn_customer(call):
     bot.send_message(chat_id, "Введите ИНН заказчика (10 или 12 цифр).")
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "carrier_enter_inn")
+def handle_carrier_inn_entry(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["scenario"] = "new_carrier_contract"
+    session["awaiting_more_data"] = True
+    session["awaiting_carrier_inn"] = True
+    session["awaiting_carrier_card_upload"] = False
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "⌨️ Введите ИНН перевозчика для автозаполнения данных из DaData:",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "carrier_upload_card")
+def handle_carrier_card_upload(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["scenario"] = "new_carrier_contract"
+    session["awaiting_more_data"] = True
+    session["awaiting_carrier_card_upload"] = True
+    session["awaiting_carrier_inn"] = False
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "📄 Загрузите карточку компании в формате DOCX, PDF или фото.\n\n"
+        "Я автоматически извлеку все реквизиты.",
+    )
+
+
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     chat_id = message.chat.id
@@ -1433,72 +1699,44 @@ def handle_photo(message):
             bot.send_message(chat_id, f"Ошибка распознавания карточки: {extract_error}")
             return
 
-        session = get_session(chat_id)
-        session["scenario"] = "new_carrier_contract"
-        session["awaiting_more_data"] = True
-
-        session["carrier_name"] = extracted.get("carrier_name", "")
-        session["carrier_type"] = extracted.get("carrier_type", "") or detect_legal_form_from_name(
-            extracted.get("carrier_name", "")
-        )
-        session["inn"] = clean_digits(extracted.get("inn", ""))
-        session["ogrn"] = extracted.get("ogrn", "")
-        session["registration_address"] = extracted.get("registration_address", "")
-        session["phone"] = normalize_phone(extracted.get("phone", ""))
-        session["email"] = extracted.get("email", "")
-        session["bank"] = extracted.get("bank", "")
-        session["rs"] = clean_digits(extracted.get("rs", ""))
-        session["ks"] = clean_digits(extracted.get("ks", ""))
-        session["bik"] = clean_digits(extracted.get("bik", ""))
-        session["director"] = extracted.get("director", "")
-        session["customer_name"] = session.get("customer_name", "")
-        session["tax_mode"] = session.get("tax_mode", "")
-
-        save_session(chat_id, session)
-
-        lines = ["Нашёл по карточке:"]
-        for key, label in [
-            ("carrier_name", "Название"),
-            ("carrier_type", "Тип"),
-            ("inn", "ИНН"),
-            ("ogrn", "ОГРН / ОГРНИП"),
-            ("registration_address", "Адрес"),
-            ("phone", "Телефон"),
-            ("email", "Email"),
-            ("bank", "Банк"),
-            ("rs", "Расчетный счет"),
-            ("ks", "Корр. счет"),
-            ("bik", "БИК"),
-        ]:
-            value = session.get(key, "")
-            if value:
-                lines.append(f"• {label}: {value}")
-
-        validation_errors = validate_session_fields(session)
-        if validation_errors:
-            lines.append("")
-            lines.append(format_validation_errors_for_user(validation_errors))
-
-        missing = missing_session_fields(session)
-        if missing:
-            lines.append("")
-            lines.append(format_missing_for_user(missing))
-            lines.append("")
-            lines.append("Пришлите недостающие данные одним сообщением.")
-        else:
-            lines.append("")
-            lines.append("Данных достаточно для создания договора.")
-
-        bot.send_message(chat_id, "\n".join(lines))
-
-        if "customer_name" in missing and not session.get("customer_name"):
-            show_customer_selection(chat_id)
+        apply_extracted_carrier_data(chat_id, extracted, source_hint="фото")
 
     except Exception as e:
         logger.exception("Ошибка в handle_photo: %s", e)
         bot.send_message(
             chat_id,
             "Не удалось обработать фото из-за внутренней ошибки. Попробуйте ещё раз через минуту.",
+        )
+
+
+@bot.message_handler(content_types=["document"])
+def handle_document(message):
+    chat_id = message.chat.id
+
+    try:
+        document = message.document
+        file_name = document.file_name or "document"
+        mime_type = document.mime_type or ""
+
+        bot.send_message(chat_id, f"Получил файл {file_name}. Извлекаю реквизиты...")
+
+        file_bytes, download_error = download_telegram_file(document.file_id)
+        if download_error:
+            bot.send_message(chat_id, f"Не удалось обработать файл: {download_error}")
+            return
+
+        extracted, extract_error = extract_card_data_from_document(file_bytes, mime_type, file_name)
+        if extract_error:
+            bot.send_message(chat_id, f"Ошибка распознавания карточки: {extract_error}")
+            return
+
+        apply_extracted_carrier_data(chat_id, extracted, source_hint=file_name)
+
+    except Exception as e:
+        logger.exception("Ошибка в handle_document: %s", e)
+        bot.send_message(
+            chat_id,
+            "Не удалось обработать файл из-за внутренней ошибки. Попробуйте ещё раз.",
         )
 
 
@@ -1540,6 +1778,50 @@ def handle_text(message):
             bot.send_message(chat_id, f"✅ Заказчик выбран: {customer.get('name', '—')}")
             if session.get("scenario") == "new_carrier_contract" and session.get("awaiting_more_data"):
                 prompt_for_missing_after_customer(chat_id, session)
+            return
+
+        if session.get("awaiting_carrier_card_upload"):
+            bot.send_message(
+                chat_id,
+                "Ожидаю карточку перевозчика файлом (DOCX/PDF) или фото. "
+                "После загрузки я автоматически извлеку реквизиты.",
+            )
+            return
+
+        if session.get("awaiting_carrier_inn"):
+            inn = clean_digits(user_text)
+            if not validate_inn(inn):
+                bot.send_message(chat_id, "ИНН перевозчика должен содержать 10 или 12 цифр. Попробуйте снова.")
+                return
+
+            company, company_error = get_company_by_inn(inn)
+            if company_error:
+                bot.send_message(
+                    chat_id,
+                    f"Не удалось получить данные из DaData: {company_error}\n"
+                    "Можно попробовать снова, загрузить карточку или заполнить Google Форму.",
+                    reply_markup=build_add_carrier_markup(),
+                )
+                return
+
+            if not company:
+                bot.send_message(
+                    chat_id,
+                    "По этому ИНН перевозчик не найден. Проверьте ИНН или используйте загрузку карточки/Google Форму.",
+                    reply_markup=build_add_carrier_markup(),
+                )
+                return
+
+            extracted = {
+                "carrier_name": company.get("name", ""),
+                "carrier_type": company.get("carrier_type", ""),
+                "inn": inn,
+                "ogrn": company.get("ogrn", ""),
+                "registration_address": company.get("address", ""),
+                "director": company.get("director", ""),
+            }
+
+            apply_extracted_carrier_data(chat_id, extracted, source_hint="DaData")
             return
 
         # Если уже ждём доп.данные по новому перевозчику
@@ -1675,6 +1957,8 @@ def handle_text(message):
             session_data = {
                 "scenario": "new_carrier_contract",
                 "awaiting_more_data": True,
+                "awaiting_carrier_inn": False,
+                "awaiting_carrier_card_upload": False,
                 "customer_name": known.get("customer_name", ""),
                 "customer_code": known.get("customer_code", ""),
                 "customer_data": known.get("customer_data", {}),
@@ -1698,6 +1982,10 @@ def handle_text(message):
                 bot.send_message(chat_id, format_validation_errors_for_user(validation_errors))
 
             save_session(chat_id, session_data)
+
+            if not session_data.get("inn") and not session_data.get("carrier_name"):
+                show_carrier_add_options(message)
+                return
 
             if not session_data.get("customer_name"):
                 show_customer_selection(chat_id)
