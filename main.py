@@ -2450,7 +2450,7 @@ def cmd_make_contract(message):
 def handle_contract_carrier_select(call):
     """Обработка выбора перевозчика для договора."""
     chat_id = call.message.chat.id
-    carrier_id = call.data.split("_")[-1]
+    carrier_id = call.data.replace("contract_carrier_", "", 1)
 
     bot.answer_callback_query(call.id)
     bot.edit_message_text(
