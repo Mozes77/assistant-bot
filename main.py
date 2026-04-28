@@ -1575,6 +1575,85 @@ def get_carrier_name_by_id(carrier_id: str) -> str:
     return ""
 
 
+def generate_carrier_contract(carrier_id: str) -> Dict[str, Any]:
+    """Генерировать договор с перевозчиком через Google Apps Script."""
+    try:
+        from datetime import datetime
+
+        script_url = os.getenv("GOOGLE_SCRIPT_URL")
+        if not script_url:
+            logger.error("GOOGLE_SCRIPT_URL не настроен")
+            return {"success": False, "error": "Сервис недоступен"}
+
+        customer_data = {
+            "name": "ООО «Фрукт Сервис»",
+            "full_name": "Общество с ограниченной ответственностью «Фрукт Сервис»",
+            "inn": "3805731231",
+            "kpp": "382701001",
+            "ogrn": "1173850020960",
+            "director": "Минин Роман Николаевич",
+            "director_short": "Р.Н. Минин",
+            "director_genitive": "Минина Романа Николаевича",
+            "address_legal": "664035, Иркутская область, г. Иркутск, Батарейная ул, дом 17, корпус 1, помещение 1",
+            "address_post": "664035, Иркутская обл, г. Иркутск, ул. Батарейная, д. 17, корп. 1, пом. 1",
+            "bank": "Байкальский Банк ПАО \"Сбербанк\"",
+            "rs": "40702810318350026308",
+            "ks": "30101810900000000607",
+            "bik": "042520607",
+            "email": "svetdrus@mail.ru",
+            "phone": "8-800-201-26-59",
+        }
+
+        contract_number = f"ДП-{carrier_id}-{datetime.now().strftime('%Y%m%d')}"
+        contract_date = datetime.now().strftime("%d.%m.%Y")
+
+        payload = {
+            "action": "generate_carrier_contract",
+            "carrier_id": carrier_id,
+            "customer_data": customer_data,
+            "contract_number": contract_number,
+            "contract_date": contract_date,
+        }
+
+        logger.info("Отправка запроса на генерацию договора: %s", payload)
+        response = requests.post(
+            script_url,
+            json=payload,
+            timeout=30,
+        )
+
+        logger.info("Ответ сервера: %s", response.status_code)
+        logger.info("Тело ответа: %s", response.text)
+
+        if response.status_code != 200:
+            return {"success": False, "error": f"HTTP {response.status_code}"}
+
+        data = response.json()
+
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), dict):
+            data = data.get("result", {})
+
+        if data.get("success"):
+            return {
+                "success": True,
+                "url": data.get("url"),
+                "contract_number": contract_number,
+                "date": contract_date,
+            }
+
+        return {
+            "success": False,
+            "error": data.get("error", "Неизвестная ошибка"),
+        }
+
+    except Exception as e:
+        logger.error("Ошибка генерации договора: %s", e, exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
 def parse_sts_document(photo_base64: str) -> Optional[Dict[str, str]]:
     """Распознать СТС через GPT-4 Vision и вернуть JSON-словарь с ключами машины."""
     if not OPENAI_API_KEY:
@@ -2335,6 +2414,75 @@ def cmd_add_vehicle(message):
     """Команда запуска сценария 'Добавить машину'."""
     logger.info("/add_vehicle от chat_id=%s", message.chat.id)
     start_add_vehicle_flow(message.chat.id)
+
+
+@bot.message_handler(commands=["make_contract"])
+def cmd_make_contract(message):
+    """Команда для генерации договора с перевозчиком."""
+    chat_id = message.chat.id
+    carriers = get_carriers_list()
+
+    if not carriers:
+        bot.send_message(chat_id, "❌ Сначала добавьте перевозчика!")
+        return
+
+    markup = InlineKeyboardMarkup()
+    for carrier in carriers:
+        carrier_id = str(carrier.get("id", "")).strip()
+        carrier_name = str(carrier.get("name", "")).strip() or f"ID {carrier_id}"
+        if not carrier_id:
+            continue
+        btn = InlineKeyboardButton(
+            text=carrier_name,
+            callback_data=f"contract_carrier_{carrier_id}",
+        )
+        markup.add(btn)
+
+    bot.send_message(
+        chat_id,
+        "📄 Генерация договора\n\n"
+        "Выберите перевозчика:",
+        reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("contract_carrier_"))
+def handle_contract_carrier_select(call):
+    """Обработка выбора перевозчика для договора."""
+    chat_id = call.message.chat.id
+    carrier_id = call.data.split("_")[-1]
+
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text="⏳ Генерирую договор...\n\nЭто может занять несколько секунд.",
+    )
+
+    result = generate_carrier_contract(carrier_id)
+
+    if result.get("success"):
+        doc_url = result.get("url")
+        contract_number = result.get("contract_number")
+
+        markup = InlineKeyboardMarkup()
+        if doc_url:
+            markup.add(InlineKeyboardButton("📄 Открыть договор", url=doc_url))
+
+        bot.send_message(
+            chat_id,
+            f"✅ Договор сгенерирован!\n\n"
+            f"📋 Номер: {contract_number}\n"
+            f"📅 Дата: {result.get('date')}\n\n"
+            f"Нажмите кнопку ниже чтобы открыть документ:",
+            reply_markup=markup if doc_url else None,
+        )
+    else:
+        error_msg = result.get("error", "Неизвестная ошибка")
+        bot.send_message(
+            chat_id,
+            f"❌ Ошибка генерации договора:\n{error_msg}",
+        )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("select_customer_"))
