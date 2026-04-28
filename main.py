@@ -9,10 +9,10 @@ import time
 import tempfile
 import subprocess
 import shutil
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 import telebot
@@ -266,6 +266,20 @@ TAX_MODE_HINTS = (
     "• Патент — для ИП\n"
     "• Самозанятый — НПД"
 )
+
+VEHICLE_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSc32gLJghdZmLkNivNmUNHsUrXLjr2OBGqWiwkohleE-GAVTg/viewform"
+VEHICLE_FORM_ENTRIES = {
+    "carrier": "entry.1043783283",
+    "brand": "entry.2119031393",
+    "model": "entry.1151962997",
+    "plate": "entry.307360506",
+    "vin": "entry.1645886453",
+    "year": "entry.339978841",
+    "capacity": "entry.2054625960",
+    "pallets": "entry.403404622",
+    "temp": "entry.1170268362",
+    "category": "entry.154994274",
+}
 
 # =========================
 # ПРОСТОЕ ХРАНЕНИЕ СЕССИЙ
@@ -1522,26 +1536,196 @@ def find_suitable_carriers(message, pallets: int):
     )
 
 
-def show_vehicle_add_options(message):
-    """Меню добавления машины."""
-    markup = InlineKeyboardMarkup()
-    vehicle_form_url = build_google_form_url("vehicle")
-    if vehicle_form_url:
-        markup.add(InlineKeyboardButton("📝 Заполнить Google Форму", url=vehicle_form_url))
+def get_carriers_list() -> List[Dict[str, Any]]:
+    """Получить список перевозчиков из Google Sheets."""
+    url = os.getenv("GOOGLE_SCRIPT_URL")
+    if not url:
+        logger.warning("get_carriers_list: GOOGLE_SCRIPT_URL не задан")
+        return []
 
-    markup.add(
-        InlineKeyboardButton(
-            "⌨️ Ввести данные вручную",
-            callback_data="vehicle_manual_entry",
+    try:
+        response = requests.get(
+            f"{url}?action=list_carriers",
+            timeout=GOOGLE_SCRIPT_TIMEOUT,
         )
+        response.raise_for_status()
+        payload = response.json()
+
+        if isinstance(payload, dict) and payload.get("ok") and isinstance(payload.get("result"), dict):
+            payload = payload.get("result", {})
+
+        if isinstance(payload, dict) and payload.get("success"):
+            carriers = payload.get("carriers", []) or []
+            logger.info("get_carriers_list: получено %s перевозчиков", len(carriers))
+            return carriers
+
+        logger.error("get_carriers_list: неожиданный ответ %s", payload)
+        return []
+    except Exception as e:
+        logger.exception("Ошибка получения списка перевозчиков: %s", e)
+        return []
+
+
+def get_carrier_name_by_id(carrier_id: str) -> str:
+    """Получить название перевозчика по ID."""
+    carriers = get_carriers_list()
+    for carrier in carriers:
+        if str(carrier.get("id", "")) == str(carrier_id):
+            return str(carrier.get("name", "")).strip()
+    return ""
+
+
+def parse_sts_document(photo_base64: str) -> Optional[Dict[str, str]]:
+    """Распознать СТС через GPT-4 Vision и вернуть JSON-словарь с ключами машины."""
+    if not OPENAI_API_KEY:
+        logger.warning("parse_sts_document: OPENAI_API_KEY не задан")
+        return None
+
+    prompt = (
+        "Это фото свидетельства о регистрации транспортного средства (СТС).\n"
+        "Извлеки следующие данные:\n"
+        "- Государственный регистрационный номер (госномер)\n"
+        "- Марка\n"
+        "- Модель\n"
+        "- VIN (идентификационный номер)\n"
+        "- Год выпуска\n\n"
+        "Верни строго JSON без markdown и комментариев:\n"
+        "{\n"
+        '  "plate": "А123БВ199",\n'
+        '  "brand": "МАН",\n'
+        '  "model": "TGX 18.440",\n'
+        '  "vin": "XYZ12345678901234",\n'
+        '  "year": "2020"\n'
+        "}"
     )
+
+    payload = {
+        "model": OPENAI_CARD_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{photo_base64}",
+                        "detail": "high",
+                    },
+                ],
+            }
+        ],
+        "store": False,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    data, error = post_json_with_handling(
+        url="https://api.openai.com/v1/responses",
+        payload=payload,
+        headers=headers,
+        timeout=OPENAI_VISION_TIMEOUT,
+        source="OpenAI STS Parser",
+    )
+    if error:
+        logger.error("parse_sts_document: ошибка запроса к OpenAI: %s", error)
+        return None
+
+    output_text = extract_output_text(data)
+    parsed, parse_error = safe_json_loads(output_text)
+    if parse_error:
+        logger.error("parse_sts_document: ошибка парсинга JSON: %s | raw=%s", parse_error, output_text)
+        return None
+
+    result = {
+        "plate": str(parsed.get("plate", "")).strip(),
+        "brand": str(parsed.get("brand", "")).strip(),
+        "model": str(parsed.get("model", "")).strip(),
+        "vin": str(parsed.get("vin", "")).strip(),
+        "year": str(parsed.get("year", "")).strip(),
+    }
+
+    if not any(result.values()):
+        logger.warning("parse_sts_document: OpenAI не вернул распознанных полей")
+        return None
+
+    logger.info("СТС распознан: %s", result)
+    return result
+
+
+def generate_vehicle_prefill_url(chat_id: int) -> str:
+    """Сформировать prefill URL для формы добавления машины."""
+    session = get_session(chat_id)
+    vehicle_data = session.get("vehicle_data", {}) or {}
+    carrier_id = session.get("vehicle_carrier_id")
+
+    carrier_name = get_carrier_name_by_id(carrier_id)
+    if not carrier_name:
+        carrier_name = session.get("selected_carrier_name", "")
+
+    params: Dict[str, str] = {}
+
+    if carrier_name:
+        params[VEHICLE_FORM_ENTRIES["carrier"]] = carrier_name
+
+    if vehicle_data.get("brand"):
+        params[VEHICLE_FORM_ENTRIES["brand"]] = str(vehicle_data["brand"])
+    if vehicle_data.get("model"):
+        params[VEHICLE_FORM_ENTRIES["model"]] = str(vehicle_data["model"])
+    if vehicle_data.get("plate"):
+        params[VEHICLE_FORM_ENTRIES["plate"]] = str(vehicle_data["plate"])
+    if vehicle_data.get("vin"):
+        params[VEHICLE_FORM_ENTRIES["vin"]] = str(vehicle_data["vin"])
+    if vehicle_data.get("year"):
+        params[VEHICLE_FORM_ENTRIES["year"]] = str(vehicle_data["year"])
+
+    prefill_url = VEHICLE_FORM_URL
+    if params:
+        prefill_url = VEHICLE_FORM_URL + "?" + urlencode(params, quote_via=quote)
+
+    logger.info("generate_vehicle_prefill_url: chat_id=%s carrier_id=%s url=%s", chat_id, carrier_id, prefill_url)
+    return prefill_url
+
+
+def start_add_vehicle_flow(chat_id: int):
+    """Запустить сценарий добавления машины с выбором перевозчика."""
+    logger.info("start_add_vehicle_flow: chat_id=%s", chat_id)
+    carriers = get_carriers_list()
+
+    if not carriers:
+        bot.send_message(chat_id, "❌ Сначала добавьте перевозчика!")
+        return
+
+    session = get_session(chat_id)
+    session["state"] = "waiting_vehicle_carrier_select"
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    for carrier in carriers:
+        carrier_id = str(carrier.get("id", "")).strip()
+        carrier_name = str(carrier.get("name", "")).strip() or f"ID {carrier_id}"
+        if not carrier_id:
+            continue
+        markup.add(
+            InlineKeyboardButton(
+                text=carrier_name,
+                callback_data=f"vehicle_carrier_{carrier_id}",
+            )
+        )
 
     bot.send_message(
-        message.chat.id,
-        "🚚 Как добавить машину?\n\n"
-        "Форма автоматически привяжет машину к перевозчику.",
+        chat_id,
+        "🚛 Добавление машины\n\n"
+        "Выберите перевозчика:",
         reply_markup=markup,
     )
+
+
+def show_vehicle_add_options(message):
+    """Меню добавления машины (быстрый вход через текст/голос)."""
+    start_add_vehicle_flow(message.chat.id)
 
 
 def show_carrier_vehicles(message, carrier_id, carrier_name):
@@ -2146,6 +2330,13 @@ def handle_refresh_carriers(message):
     )
 
 
+@bot.message_handler(commands=["add_vehicle"])
+def cmd_add_vehicle(message):
+    """Команда запуска сценария 'Добавить машину'."""
+    logger.info("/add_vehicle от chat_id=%s", message.chat.id)
+    start_add_vehicle_flow(message.chat.id)
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("select_customer_"))
 def handle_customer_selection(call):
     chat_id = call.message.chat.id
@@ -2338,6 +2529,81 @@ def handle_cancel_existing_carrier(call):
 
     bot.answer_callback_query(call.id, "Отменено")
     bot.send_message(chat_id, "❌ Операция с перевозчиком отменена.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("vehicle_carrier_"))
+def handle_vehicle_carrier_select(call):
+    chat_id = call.message.chat.id
+    carrier_id = call.data.split("_", 2)[-1]
+    logger.info("handle_vehicle_carrier_select: chat_id=%s carrier_id=%s", chat_id, carrier_id)
+
+    session = get_session(chat_id)
+    session["vehicle_carrier_id"] = carrier_id
+    session["state"] = "waiting_sts_upload"
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📸 Загрузить СТС", callback_data="upload_sts"))
+    markup.add(InlineKeyboardButton("📝 Заполнить форму вручную", callback_data="manual_vehicle_form"))
+
+    carrier_name = get_carrier_name_by_id(carrier_id) or f"ID {carrier_id}"
+
+    bot.answer_callback_query(call.id, "Перевозчик выбран")
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text=(
+            "✅ Перевозчик выбран!\n"
+            f"Перевозчик: {carrier_name}\n\n"
+            "Как добавить машину?"
+        ),
+        reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "upload_sts")
+def handle_upload_sts_button(call):
+    chat_id = call.message.chat.id
+    logger.info("handle_upload_sts_button: chat_id=%s", chat_id)
+
+    session = get_session(chat_id)
+    session["state"] = "waiting_sts_photo"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "📸 Загрузите фото СТС (свидетельство о регистрации)\n\n"
+        "Я распознаю:\n"
+        "✅ Госномер\n"
+        "✅ Марка и модель\n"
+        "✅ VIN\n"
+        "✅ Год выпуска",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "manual_vehicle_form")
+def handle_manual_vehicle_form(call):
+    chat_id = call.message.chat.id
+    logger.info("handle_manual_vehicle_form: chat_id=%s", chat_id)
+
+    session = get_session(chat_id)
+    session["state"] = ""
+    session.pop("vehicle_data", None)
+    save_session(chat_id, session)
+
+    prefill_url = generate_vehicle_prefill_url(chat_id)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📝 Открыть форму", url=prefill_url))
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "📝 Откройте форму и заполните данные машины вручную.\n"
+        "Перевозчик уже подставлен автоматически.",
+        reply_markup=markup,
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "vehicle_manual_entry")
@@ -2567,6 +2833,58 @@ def handle_photo(message):
         largest_photo = message.photo[-1]
         file_id = largest_photo.file_id
 
+        session = get_session(chat_id)
+        state = session.get("state", "")
+
+        # Сценарий добавления машины через СТС
+        if state == "waiting_sts_photo":
+            bot.send_message(chat_id, "🔍 Распознаю СТС...")
+            image_bytes, download_error = download_telegram_file(file_id)
+            if download_error:
+                bot.send_message(chat_id, f"Не удалось обработать фото СТС: {download_error}")
+                return
+
+            photo_base64 = base64.b64encode(image_bytes).decode("utf-8")
+            extracted = parse_sts_document(photo_base64)
+            if not extracted:
+                bot.send_message(
+                    chat_id,
+                    "❌ Не удалось распознать СТС. Попробуйте загрузить фото получше.",
+                )
+                return
+
+            session["vehicle_data"] = extracted
+            summary = (
+                f"✅ Данные распознаны:\n\n"
+                f"🚗 Марка: {extracted.get('brand', '—') or '—'}\n"
+                f"📋 Модель: {extracted.get('model', '—') or '—'}\n"
+                f"🔢 Госномер: {extracted.get('plate', '—') or '—'}\n"
+                f"🔑 VIN: {extracted.get('vin', '—') or '—'}\n"
+                f"📅 Год: {extracted.get('year', '—') or '—'}\n\n"
+                "Открываю форму для заполнения остальных данных..."
+            )
+            bot.send_message(chat_id, summary)
+
+            prefill_url = generate_vehicle_prefill_url(chat_id)
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("📝 Открыть форму", url=prefill_url))
+
+            bot.send_message(
+                chat_id,
+                "📝 Форма готова!\n\n"
+                "Распознанные данные уже заполнены.\n"
+                "Дополните:\n"
+                "• Грузоподъёмность (тонн)\n"
+                "• Вместимость (европалет)\n"
+                "• Температурный режим\n\n"
+                "Нажмите кнопку ниже:",
+                reply_markup=markup,
+            )
+
+            session["state"] = ""
+            save_session(chat_id, session)
+            return
+
         bot.send_message(chat_id, "Получил фото. Считываю реквизиты с карточки...")
 
         image_bytes, download_error = download_telegram_file(file_id)
@@ -2579,8 +2897,6 @@ def handle_photo(message):
             bot.send_message(chat_id, f"Ошибка распознавания карточки: {extract_error}")
             return
 
-        session = get_session(chat_id)
-        state = session.get("state", "")
         if state in ("waiting_carrier_phone", "waiting_carrier_email", "waiting_carrier_bank", "waiting_carrier_flexible_input") or session.get("awaiting_carrier_card_upload"):
             bot.send_message(chat_id, "⏳ Обрабатываю карточку предприятия...")
             session = merge_extracted_into_carrier_data(session, extracted)
