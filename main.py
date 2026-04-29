@@ -1604,14 +1604,12 @@ def generate_carrier_contract(carrier_id: str) -> Dict[str, Any]:
             "phone": "8-800-201-26-59",
         }
 
-        contract_number = f"ДП-{carrier_id}-{datetime.now().strftime('%Y%m%d')}"
         contract_date = datetime.now().strftime("%d.%m.%Y")
 
         payload = {
             "action": "generate_carrier_contract",
             "carrier_id": carrier_id,
             "customer_data": customer_data,
-            "contract_number": contract_number,
             "contract_date": contract_date,
         }
 
@@ -1637,7 +1635,7 @@ def generate_carrier_contract(carrier_id: str) -> Dict[str, Any]:
             return {
                 "success": True,
                 "url": data.get("url"),
-                "contract_number": contract_number,
+                "contract_number": data.get("contract_number"),
                 "date": contract_date,
             }
 
@@ -2416,7 +2414,7 @@ def cmd_add_vehicle(message):
     start_add_vehicle_flow(message.chat.id)
 
 
-@bot.message_handler(commands=["make_contract"])
+@bot.message_handler(commands=["договор", "make_contract"])
 def cmd_make_contract(message):
     """Команда для генерации договора с перевозчиком."""
     chat_id = message.chat.id
@@ -2440,7 +2438,7 @@ def cmd_make_contract(message):
 
     bot.send_message(
         chat_id,
-        "📄 Генерация договора\n\n"
+        "📄 Генерация договора с перевозчиком\n\n"
         "Выберите перевозчика:",
         reply_markup=markup,
     )
