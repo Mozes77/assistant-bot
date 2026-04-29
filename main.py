@@ -1538,31 +1538,49 @@ def find_suitable_carriers(message, pallets: int):
 
 def get_carriers_list() -> List[Dict[str, Any]]:
     """Получить список перевозчиков из Google Sheets."""
-    url = os.getenv("GOOGLE_SCRIPT_URL")
-    if not url:
-        logger.warning("get_carriers_list: GOOGLE_SCRIPT_URL не задан")
-        return []
-
     try:
-        response = requests.get(
-            f"{url}?action=list_carriers",
-            timeout=GOOGLE_SCRIPT_TIMEOUT,
+        script_url = os.getenv("GOOGLE_SCRIPT_URL")
+
+        if not script_url:
+            logger.error("GOOGLE_SCRIPT_URL не настроен")
+            return []
+
+        payload = {
+            "action": "list_carriers",
+        }
+
+        logger.info("Запрос списка перевозчиков: %s", script_url)
+
+        response = requests.post(
+            script_url,
+            json=payload,
+            timeout=10,
         )
-        response.raise_for_status()
-        payload = response.json()
 
-        if isinstance(payload, dict) and payload.get("ok") and isinstance(payload.get("result"), dict):
-            payload = payload.get("result", {})
+        logger.info("Ответ: %s", response.status_code)
 
-        if isinstance(payload, dict) and payload.get("success"):
-            carriers = payload.get("carriers", []) or []
-            logger.info("get_carriers_list: получено %s перевозчиков", len(carriers))
-            return carriers
+        if response.status_code == 200:
+            data = response.json()
 
-        logger.error("get_carriers_list: неожиданный ответ %s", payload)
+            # Поддержка обертки jsonOutput_({ok:true, result:{...}})
+            if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), dict):
+                data = data.get("result", {})
+
+            if isinstance(data, dict) and data.get("success"):
+                carriers = data.get("carriers", []) or []
+                logger.info("Получено перевозчиков: %s", len(carriers))
+                return carriers
+
+            error = data.get("error", "Неизвестная ошибка") if isinstance(data, dict) else "Некорректный ответ"
+            logger.error("Ошибка от сервера: %s", error)
+            return []
+
+        logger.error("HTTP ошибка: %s", response.status_code)
+        logger.error("Тело ответа: %s", response.text)
         return []
+
     except Exception as e:
-        logger.exception("Ошибка получения списка перевозчиков: %s", e)
+        logger.error("Ошибка получения списка перевозчиков: %s", e, exc_info=True)
         return []
 
 
@@ -2418,18 +2436,30 @@ def cmd_add_vehicle(message):
 def cmd_make_contract(message):
     """Команда для генерации договора с перевозчиком."""
     chat_id = message.chat.id
+
+    logger.info("Команда /договор от пользователя %s", chat_id)
+
     carriers = get_carriers_list()
 
+    logger.info("Получено перевозчиков: %s", len(carriers) if carriers else 0)
+
     if not carriers:
-        bot.send_message(chat_id, "❌ Сначала добавьте перевозчика!")
+        logger.warning("Список перевозчиков пустой")
+        bot.send_message(
+            chat_id,
+            "❌ Сначала добавьте перевозчика!\n\nИспользуйте команду для добавления перевозчика.",
+        )
         return
 
     markup = InlineKeyboardMarkup()
     for carrier in carriers:
         carrier_id = str(carrier.get("id", "")).strip()
         carrier_name = str(carrier.get("name", "")).strip() or f"ID {carrier_id}"
+
         if not carrier_id:
             continue
+
+        logger.info("Добавляю кнопку: %s (ID: %s)", carrier_name, carrier_id)
         btn = InlineKeyboardButton(
             text=carrier_name,
             callback_data=f"contract_carrier_{carrier_id}",
