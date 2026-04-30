@@ -2011,7 +2011,7 @@ def build_add_customer_markup() -> InlineKeyboardMarkup:
     markup.add(
         InlineKeyboardButton(
             "📝 Заполнить Google Форму",
-            url="https://script.google.com/macros/s/AKfycbwQkC2kc8V9oD1fn7Ug8cLUGqnw8S0ZuCFIkBgRZcr1V3dNeFRV-JFAPOt45DBP5p-z/exec?page=customer",
+            url="https://script.google.com/macros/s/AKfycbwsmt46_3qRA2zBdCgsFW-bkDGXuC3JV-GUMefAMOdWnjC2fErmQdBuF4MhAoWgq88R/execr",
         )
     )
     markup.add(InlineKeyboardButton("⌨️ Ввести ИНН", callback_data="enter_inn_customer"))
