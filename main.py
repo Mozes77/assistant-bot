@@ -34,6 +34,8 @@ try:
 except Exception:  # pragma: no cover
     PdfReader = None
 
+from card_parser import CardParser, FIELD_LABELS, CARRIER_REQUIRED_FIELDS, CUSTOMER_REQUIRED_FIELDS
+
 # =========================
 # КОНСТАНТЫ И ЛОГИРОВАНИЕ
 # =========================
@@ -2378,6 +2380,334 @@ def merge_extracted_into_carrier_data(session: Dict[str, Any], extracted: Dict[s
 
 
 # =========================
+# СКАНИРОВАНИЕ КАРТОЧЕК
+# =========================
+
+SCAN_ENTITY_FIELDS = {
+    "carrier": {
+        "label": "Перевозчик",
+        "emoji": "🚚",
+        "required": [
+            "name", "inn", "carrier_type", "director",
+            "address", "phone", "email",
+            "bank", "rs", "ks", "bik", "tax_mode",
+        ],
+        "field_labels": {
+            "name": "Название компании",
+            "inn": "ИНН",
+            "kpp": "КПП",
+            "ogrn": "ОГРН / ОГРНИП",
+            "snils": "СНИЛС",
+            "carrier_type": "Тип (ИП / ООО / Самозанятый)",
+            "director": "Директор / ФИО ИП",
+            "address": "Юридический адрес",
+            "phone": "Телефон",
+            "email": "Email",
+            "bank": "Название банка",
+            "rs": "Расчётный счёт (20 цифр)",
+            "ks": "Корр. счёт (20 цифр)",
+            "bik": "БИК (9 цифр)",
+            "tax_mode": "Налогообложение (ОСНО / УСН / Патент / Самозанятый)",
+        },
+    },
+    "customer": {
+        "label": "Заказчик",
+        "emoji": "🏢",
+        "required": [
+            "name", "inn", "director",
+            "address", "phone", "email",
+            "bank", "rs", "ks", "bik",
+        ],
+        "field_labels": {
+            "name": "Название компании",
+            "inn": "ИНН",
+            "kpp": "КПП",
+            "ogrn": "ОГРН",
+            "director": "Директор",
+            "address": "Юридический адрес",
+            "phone": "Телефон",
+            "email": "Email",
+            "bank": "Название банка",
+            "rs": "Расчётный счёт (20 цифр)",
+            "ks": "Корр. счёт (20 цифр)",
+            "bik": "БИК (9 цифр)",
+        },
+    },
+}
+
+
+def format_scan_summary(parsed: Dict[str, Any], entity_type: str) -> str:
+    """Форматировать результат сканирования в читаемый вид."""
+    config = SCAN_ENTITY_FIELDS.get(entity_type, SCAN_ENTITY_FIELDS["carrier"])
+    labels = config["field_labels"]
+    required = config["required"]
+
+    found_lines = []
+    missing_lines = []
+
+    for field in required:
+        label = labels.get(field, field)
+        value = parsed.get(field, "")
+        if value:
+            found_lines.append(f"  • {label}: <b>{value}</b>")
+        else:
+            missing_lines.append(f"  • {label}")
+
+    # Также показываем доп. поля если они найдены
+    extra_fields = ["kpp", "ogrn", "snils", "phone2"]
+    for field in extra_fields:
+        if field not in required:
+            value = parsed.get(field, "")
+            if value:
+                label = labels.get(field, FIELD_LABELS.get(field, field))
+                found_lines.append(f"  • {label}: <b>{value}</b>")
+
+    parts = []
+    if found_lines:
+        parts.append("✅ <b>Распознано:</b>\n" + "\n".join(found_lines))
+    if missing_lines:
+        parts.append("❓ <b>Не найдено:</b>\n" + "\n".join(missing_lines))
+
+    return "\n\n".join(parts)
+
+
+def get_next_missing_scan_field(session: Dict[str, Any]) -> Optional[str]:
+    """Получить следующее незаполненное обязательное поле для сканирования."""
+    entity_type = session.get("scan_entity_type", "carrier")
+    config = SCAN_ENTITY_FIELDS.get(entity_type, SCAN_ENTITY_FIELDS["carrier"])
+    scan_data = session.get("scan_data", {})
+
+    for field in config["required"]:
+        if not scan_data.get(field):
+            return field
+    return None
+
+
+def ask_scan_next_field(chat_id: int):
+    """Запросить следующее незаполненное поле при сканировании."""
+    session = get_session(chat_id)
+    entity_type = session.get("scan_entity_type", "carrier")
+    config = SCAN_ENTITY_FIELDS.get(entity_type, SCAN_ENTITY_FIELDS["carrier"])
+    scan_data = session.get("scan_data", {})
+
+    next_field = get_next_missing_scan_field(session)
+
+    if not next_field:
+        # Все поля заполнены — сохраняем
+        save_scanned_entity(chat_id)
+        return
+
+    label = config["field_labels"].get(next_field, next_field)
+    session["scan_waiting_for"] = next_field
+    session["state"] = "scan_waiting_field"
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("⏩ Пропустить", callback_data="scan_skip_field"))
+    markup.add(InlineKeyboardButton("💾 Сохранить как есть", callback_data="scan_save_now"))
+    markup.add(InlineKeyboardButton("❌ Отменить", callback_data="scan_cancel"))
+
+    bot.send_message(
+        chat_id,
+        f"📝 Введите <b>{label}</b>:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def save_scanned_entity(chat_id: int):
+    """Сохранить отсканированные данные в Google Sheets."""
+    session = get_session(chat_id)
+    entity_type = session.get("scan_entity_type", "carrier")
+    scan_data = session.get("scan_data", {})
+
+    if entity_type == "carrier":
+        # Используем существующий flow сохранения перевозчика
+        session["carrier_data"] = {
+            "name": scan_data.get("name", ""),
+            "short_name": scan_data.get("name", ""),
+            "carrier_type": scan_data.get("carrier_type", ""),
+            "inn": clean_digits(scan_data.get("inn", "")),
+            "kpp": clean_digits(scan_data.get("kpp", "")),
+            "ogrn": scan_data.get("ogrn", ""),
+            "snils": clean_digits(scan_data.get("snils", "")),
+            "address": scan_data.get("address", ""),
+            "director": scan_data.get("director", ""),
+            "phone": normalize_phone(scan_data.get("phone", "")),
+            "phone2": normalize_phone(scan_data.get("phone2", "")),
+            "email": scan_data.get("email", ""),
+            "bank": scan_data.get("bank", ""),
+            "account": clean_digits(scan_data.get("rs", "")),
+            "corr_account": clean_digits(scan_data.get("ks", "")),
+            "bik": clean_digits(scan_data.get("bik", "")),
+            "tax_mode": normalize_tax_mode(scan_data.get("tax_mode", "")),
+        }
+        session = sync_session_with_carrier_data(session)
+        session["state"] = ""
+        session["scan_mode"] = False
+        save_session(chat_id, session)
+
+        if save_carrier_to_sheets(chat_id):
+            session = get_session(chat_id)
+            save_action = session.get("carrier_save_action", "created")
+            status_emoji = "🔄" if save_action == "updated" else "✅"
+            status_text = "обновлён" if save_action == "updated" else "добавлен"
+            bot.send_message(
+                chat_id,
+                f"{status_emoji} <b>Перевозчик {status_text}!</b>\n\n"
+                f"🚚 {scan_data.get('name', '—')}\n"
+                f"ИНН: {scan_data.get('inn', '—')}\n"
+                f"📞 {scan_data.get('phone', '—')}\n"
+                f"📧 {scan_data.get('email', '—')}",
+                parse_mode="HTML",
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                "❌ Не удалось сохранить перевозчика. Попробуйте ещё раз позже.",
+            )
+        clear_scan_state(chat_id)
+
+    elif entity_type == "customer":
+        # Сохранение заказчика через Apps Script
+        payload = {
+            "action": "create_customer",
+            "customer_data": {
+                "name": scan_data.get("name", ""),
+                "inn": clean_digits(scan_data.get("inn", "")),
+                "kpp": clean_digits(scan_data.get("kpp", "")),
+                "ogrn": scan_data.get("ogrn", ""),
+                "director": scan_data.get("director", ""),
+                "address": scan_data.get("address", ""),
+                "phone": normalize_phone(scan_data.get("phone", "")),
+                "email": scan_data.get("email", ""),
+                "bank": scan_data.get("bank", ""),
+                "rs": clean_digits(scan_data.get("rs", "")),
+                "ks": clean_digits(scan_data.get("ks", "")),
+                "bik": clean_digits(scan_data.get("bik", "")),
+            },
+        }
+
+        data, error = call_google_script(payload)
+        if error:
+            bot.send_message(chat_id, f"❌ Ошибка сохранения заказчика: {error}")
+        elif data.get("success") or (data.get("ok") and isinstance(data.get("result"), dict) and data["result"].get("success")):
+            bot.send_message(
+                chat_id,
+                f"✅ <b>Заказчик добавлен!</b>\n\n"
+                f"🏢 {scan_data.get('name', '—')}\n"
+                f"ИНН: {scan_data.get('inn', '—')}\n"
+                f"📞 {scan_data.get('phone', '—')}\n"
+                f"📧 {scan_data.get('email', '—')}",
+                parse_mode="HTML",
+            )
+            # Обновляем кэш заказчиков
+            get_customers_list(force_refresh=True)
+        else:
+            error_msg = data.get("error", "Неизвестная ошибка")
+            bot.send_message(chat_id, f"❌ Ошибка сохранения заказчика: {error_msg}")
+
+        clear_scan_state(chat_id)
+
+
+def clear_scan_state(chat_id: int):
+    """Очистить состояние сканирования."""
+    session = get_session(chat_id)
+    for key in ["scan_mode", "scan_entity_type", "scan_data", "scan_waiting_for"]:
+        session.pop(key, None)
+    if session.get("state", "").startswith("scan_"):
+        session["state"] = ""
+    save_session(chat_id, session)
+
+
+def process_scan_photo(chat_id: int, file_id: str):
+    """Обработать фото в режиме сканирования."""
+    bot.send_message(chat_id, "📸 Обрабатываю изображение...")
+
+    image_bytes, download_error = download_telegram_file(file_id)
+    if download_error:
+        bot.send_message(chat_id, f"❌ Не удалось скачать фото: {download_error}")
+        return
+
+    # Распознавание через OpenAI Vision (основной метод)
+    extracted, extract_error = extract_card_data_from_image(image_bytes)
+    if extract_error:
+        bot.send_message(chat_id, f"❌ Ошибка распознавания: {extract_error}")
+        return
+
+    # Нормализуем данные из Vision в плоский формат
+    scan_data = {
+        "name": extracted.get("name") or extracted.get("carrier_name") or "",
+        "carrier_type": extracted.get("carrier_type") or "",
+        "inn": clean_digits(extracted.get("inn") or ""),
+        "kpp": clean_digits(extracted.get("kpp") or ""),
+        "ogrn": extracted.get("ogrn") or "",
+        "snils": clean_digits(extracted.get("snils") or ""),
+        "director": extracted.get("director") or "",
+        "address": extracted.get("address") or extracted.get("registration_address") or "",
+        "phone": normalize_phone(extracted.get("phone") or ""),
+        "phone2": normalize_phone(extracted.get("phone2") or ""),
+        "email": (extracted.get("email") or "").strip(),
+        "bank": extracted.get("bank") or "",
+        "rs": clean_digits(extracted.get("rs") or extracted.get("account") or ""),
+        "ks": clean_digits(extracted.get("ks") or extracted.get("corr_account") or ""),
+        "bik": clean_digits(extracted.get("bik") or ""),
+        "tax_mode": normalize_tax_mode(extracted.get("tax_mode") or ""),
+    }
+
+    # Если есть ИНН — обогащаем через DaData
+    if scan_data.get("inn") and validate_inn(scan_data["inn"]):
+        company, dadata_error = get_company_by_inn(scan_data["inn"])
+        if not dadata_error and company:
+            if company.get("name") and not scan_data.get("name"):
+                scan_data["name"] = company["name"]
+            if company.get("address") and not scan_data.get("address"):
+                scan_data["address"] = company["address"]
+            if company.get("ogrn") and not scan_data.get("ogrn"):
+                scan_data["ogrn"] = company["ogrn"]
+            if company.get("carrier_type") and not scan_data.get("carrier_type"):
+                scan_data["carrier_type"] = company["carrier_type"]
+            if company.get("director") and not scan_data.get("director"):
+                scan_data["director"] = company["director"]
+
+    session = get_session(chat_id)
+    session["scan_data"] = scan_data
+    session["state"] = "scan_choose_type"
+    save_session(chat_id, session)
+
+    # Формируем превью (пока без entity_type, покажем нейтрально)
+    found_lines = []
+    for field, label in [
+        ("name", "Название"), ("inn", "ИНН"), ("kpp", "КПП"),
+        ("ogrn", "ОГРН"), ("carrier_type", "Тип"),
+        ("director", "Директор"), ("address", "Адрес"),
+        ("phone", "Телефон"), ("email", "Email"),
+        ("bank", "Банк"), ("rs", "Р/с"), ("ks", "К/с"), ("bik", "БИК"),
+        ("tax_mode", "Налогообложение"),
+    ]:
+        value = scan_data.get(field, "")
+        if value:
+            found_lines.append(f"  • {label}: <b>{value}</b>")
+
+    response = "📋 <b>Результат распознавания:</b>\n\n"
+    if found_lines:
+        response += "\n".join(found_lines)
+    else:
+        response += "⚠️ Не удалось распознать данные. Попробуйте фото получше."
+
+    response += "\n\n<b>Это перевозчик или заказчик?</b>"
+
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("🚚 Перевозчик", callback_data="scan_type_carrier"),
+        InlineKeyboardButton("🏢 Заказчик", callback_data="scan_type_customer"),
+    )
+    markup.add(InlineKeyboardButton("❌ Отменить", callback_data="scan_cancel"))
+
+    bot.send_message(chat_id, response, parse_mode="HTML", reply_markup=markup)
+
+
+# =========================
 # TELEGRAM
 # =========================
 
@@ -2395,14 +2725,17 @@ def handle_start(message):
         "— создавать договоры с перевозчиками\n"
         "— подтягивать реквизиты по ИНН через DaData\n"
         "— считывать карточку предприятия с фото\n"
+        "— 📸 сканировать визитки и документы с реквизитами\n"
         "— дозапрашивать недостающие данные\n"
         "— создавать перевозчика и договор через Google Script\n\n"
         "Доступные команды:\n"
+        "• /сканировать — 📸 сканировать карточку предприятия\n"
         "• /формы — формы для добавления данных\n"
-        "• /договор — создать договор с перевозчиком\n\n"
+        "• /договор — создать договор с перевозчиком\n"
+        "• /отмена — отменить текущую операцию\n\n"
         "Примеры:\n"
         "1) Сделай договор новый перевозчик ИНН 381250673578\n"
-        "2) Отправь фото карточки предприятия\n\n"
+        "2) /сканировать → отправьте фото карточки\n\n"
         "Выберите действие:",
         parse_mode="HTML",
         reply_markup=markup,
@@ -2420,6 +2753,134 @@ def callback_show_forms(call):
 def handle_reset(message):
     clear_session(message.chat.id)
     bot.send_message(message.chat.id, "Сессия очищена.")
+
+
+# =========================
+# КОМАНДЫ СКАНИРОВАНИЯ
+# =========================
+
+
+@bot.message_handler(commands=["scan", "сканировать"])
+def cmd_start_scanning(message):
+    """Запустить режим сканирования карточки предприятия."""
+    chat_id = message.chat.id
+    logger.info("/сканировать от chat_id=%s", chat_id)
+
+    session = get_session(chat_id)
+    session["scan_mode"] = True
+    session["state"] = "scan_waiting_photo"
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("❌ Отменить", callback_data="scan_cancel"))
+
+    bot.send_message(
+        chat_id,
+        "📸 <b>Режим сканирования карточки предприятия</b>\n\n"
+        "Отправьте фото карточки, визитки или документа с реквизитами.\n\n"
+        "Я распознаю данные:\n"
+        "• ИНН, КПП, ОГРН\n"
+        "• Название, директор, адрес\n"
+        "• Телефон, email\n"
+        "• Банковские реквизиты (р/с, к/с, БИК)\n\n"
+        "Также можно отправить <b>PDF</b> или <b>DOCX</b> файл.\n\n"
+        "Для отмены: /отмена",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+@bot.message_handler(commands=["cancel", "отмена"])
+def cmd_cancel(message):
+    """Отменить текущую операцию."""
+    chat_id = message.chat.id
+    session = get_session(chat_id)
+
+    was_scanning = session.get("scan_mode", False)
+    clear_scan_state(chat_id)
+
+    if was_scanning:
+        bot.send_message(chat_id, "❌ Сканирование отменено.")
+    else:
+        state = session.get("state", "")
+        if state:
+            session["state"] = ""
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "❌ Операция отменена.")
+        else:
+            bot.send_message(chat_id, "Нечего отменять.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("scan_type_"))
+def callback_scan_type_selection(call):
+    """Обработка выбора типа сущности при сканировании."""
+    chat_id = call.message.chat.id
+    entity_type = "carrier" if call.data == "scan_type_carrier" else "customer"
+
+    session = get_session(chat_id)
+    session["scan_entity_type"] = entity_type
+    session["state"] = "scan_waiting_field"
+    save_session(chat_id, session)
+
+    config = SCAN_ENTITY_FIELDS[entity_type]
+    bot.answer_callback_query(call.id, f"Выбран: {config['label']}")
+
+    # Показываем сводку с учётом типа
+    summary = format_scan_summary(session.get("scan_data", {}), entity_type)
+
+    bot.send_message(
+        chat_id,
+        f"{config['emoji']} <b>{config['label']}</b>\n\n{summary}",
+        parse_mode="HTML",
+    )
+
+    # Начинаем спрашивать недостающие поля
+    ask_scan_next_field(chat_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "scan_skip_field")
+def callback_scan_skip_field(call):
+    """Пропустить текущее поле при сканировании."""
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+
+    current_field = session.get("scan_waiting_for", "")
+    if current_field:
+        # Отмечаем поле как пропущенное, ставим пустую строку чтобы не спрашивать снова
+        scan_data = session.get("scan_data", {})
+        scan_data[current_field] = "__skipped__"
+        session["scan_data"] = scan_data
+        save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "Пропущено")
+    ask_scan_next_field(chat_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "scan_save_now")
+def callback_scan_save_now(call):
+    """Сохранить данные как есть, не дожидаясь заполнения всех полей."""
+    chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id, "Сохраняю...")
+
+    # Очищаем маркеры пропущенных полей
+    session = get_session(chat_id)
+    scan_data = session.get("scan_data", {})
+    for key, value in list(scan_data.items()):
+        if value == "__skipped__":
+            scan_data[key] = ""
+    session["scan_data"] = scan_data
+    save_session(chat_id, session)
+
+    save_scanned_entity(chat_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "scan_cancel")
+def callback_scan_cancel(call):
+    """Отменить сканирование."""
+    chat_id = call.message.chat.id
+    clear_scan_state(chat_id)
+    bot.answer_callback_query(call.id, "Отменено")
+    bot.send_message(chat_id, "❌ Сканирование отменено.")
 
 
 # =========================
@@ -3153,6 +3614,11 @@ def handle_photo(message):
         session = get_session(chat_id)
         state = session.get("state", "")
 
+        # Режим сканирования карточки
+        if session.get("scan_mode") or state == "scan_waiting_photo":
+            process_scan_photo(chat_id, file_id)
+            return
+
         # Сценарий добавления машины через СТС
         if state == "waiting_sts_photo":
             bot.send_message(chat_id, "🔍 Распознаю СТС...")
@@ -3242,6 +3708,92 @@ def handle_document(message):
         file_name = document.file_name or "document"
         mime_type = document.mime_type or ""
 
+        session = get_session(chat_id)
+        state = session.get("state", "")
+
+        # В режиме сканирования — обрабатываем документ как карточку
+        if session.get("scan_mode") or state == "scan_waiting_photo":
+            bot.send_message(chat_id, f"📄 Обрабатываю файл {file_name}...")
+
+            file_bytes, download_error = download_telegram_file(document.file_id)
+            if download_error:
+                bot.send_message(chat_id, f"❌ Не удалось скачать файл: {download_error}")
+                return
+
+            # Если это изображение — обрабатываем как фото
+            if mime_type.startswith("image/"):
+                extracted, extract_error = extract_card_data_from_image(file_bytes)
+            else:
+                extracted, extract_error = extract_card_data_from_document(file_bytes, mime_type, file_name)
+
+            if extract_error:
+                bot.send_message(chat_id, f"❌ Ошибка распознавания: {extract_error}")
+                return
+
+            # Нормализуем и обрабатываем как при сканировании фото
+            scan_data = {
+                "name": extracted.get("name") or extracted.get("carrier_name") or "",
+                "carrier_type": extracted.get("carrier_type") or "",
+                "inn": clean_digits(extracted.get("inn") or ""),
+                "kpp": clean_digits(extracted.get("kpp") or ""),
+                "ogrn": extracted.get("ogrn") or "",
+                "snils": clean_digits(extracted.get("snils") or ""),
+                "director": extracted.get("director") or "",
+                "address": extracted.get("address") or extracted.get("registration_address") or "",
+                "phone": normalize_phone(extracted.get("phone") or ""),
+                "phone2": normalize_phone(extracted.get("phone2") or ""),
+                "email": (extracted.get("email") or "").strip(),
+                "bank": extracted.get("bank") or "",
+                "rs": clean_digits(extracted.get("rs") or extracted.get("account") or ""),
+                "ks": clean_digits(extracted.get("ks") or extracted.get("corr_account") or ""),
+                "bik": clean_digits(extracted.get("bik") or ""),
+                "tax_mode": normalize_tax_mode(extracted.get("tax_mode") or ""),
+            }
+
+            # DaData обогащение
+            if scan_data.get("inn") and validate_inn(scan_data["inn"]):
+                company, _ = get_company_by_inn(scan_data["inn"])
+                if company:
+                    for k in ["name", "address", "ogrn", "carrier_type", "director"]:
+                        if company.get(k) and not scan_data.get(k):
+                            scan_data[k] = company[k]
+
+            session["scan_data"] = scan_data
+            session["state"] = "scan_choose_type"
+            save_session(chat_id, session)
+
+            # Показываем результат и кнопки выбора типа
+            found_lines = []
+            for field, label in [
+                ("name", "Название"), ("inn", "ИНН"), ("kpp", "КПП"),
+                ("ogrn", "ОГРН"), ("carrier_type", "Тип"),
+                ("director", "Директор"), ("address", "Адрес"),
+                ("phone", "Телефон"), ("email", "Email"),
+                ("bank", "Банк"), ("rs", "Р/с"), ("ks", "К/с"), ("bik", "БИК"),
+                ("tax_mode", "Налогообложение"),
+            ]:
+                value = scan_data.get(field, "")
+                if value:
+                    found_lines.append(f"  • {label}: <b>{value}</b>")
+
+            response = "📋 <b>Результат распознавания:</b>\n\n"
+            if found_lines:
+                response += "\n".join(found_lines)
+            else:
+                response += "⚠️ Не удалось распознать данные."
+
+            response += "\n\n<b>Это перевозчик или заказчик?</b>"
+
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("🚚 Перевозчик", callback_data="scan_type_carrier"),
+                InlineKeyboardButton("🏢 Заказчик", callback_data="scan_type_customer"),
+            )
+            markup.add(InlineKeyboardButton("❌ Отменить", callback_data="scan_cancel"))
+
+            bot.send_message(chat_id, response, parse_mode="HTML", reply_markup=markup)
+            return
+
         bot.send_message(chat_id, f"Получил файл {file_name}. Извлекаю реквизиты...")
 
         file_bytes, download_error = download_telegram_file(document.file_id)
@@ -3318,6 +3870,71 @@ def handle_text(message):
     try:
         session = get_session(chat_id)
         state = session.get("state", "")
+
+        # Обработка ввода поля в режиме сканирования
+        if state == "scan_waiting_field" and session.get("scan_waiting_for"):
+            field = session["scan_waiting_for"]
+            scan_data = session.get("scan_data", {})
+
+            # Валидация введённого значения
+            value = user_text.strip()
+
+            if field == "inn":
+                value = clean_digits(value)
+                if not validate_inn(value):
+                    bot.send_message(chat_id, "⚠️ ИНН должен содержать 10 или 12 цифр. Попробуйте ещё раз:")
+                    return
+            elif field == "bik":
+                value = clean_digits(value)
+                if not validate_bik(value):
+                    bot.send_message(chat_id, "⚠️ БИК должен содержать 9 цифр. Попробуйте ещё раз:")
+                    return
+            elif field in ("rs", "ks"):
+                value = clean_digits(value)
+                if not validate_account_20(value):
+                    bot.send_message(chat_id, "⚠️ Счёт должен содержать 20 цифр. Попробуйте ещё раз:")
+                    return
+            elif field == "phone":
+                value = normalize_phone(value)
+                if not value:
+                    bot.send_message(chat_id, "⚠️ Некорректный номер телефона. Формат: +7XXXXXXXXXX или 8XXXXXXXXXX")
+                    return
+            elif field == "email":
+                if not validate_email(value):
+                    bot.send_message(chat_id, "⚠️ Некорректный email. Попробуйте ещё раз:")
+                    return
+            elif field == "tax_mode":
+                normalized = normalize_tax_mode(value)
+                if normalized:
+                    value = normalized
+                else:
+                    bot.send_message(
+                        chat_id,
+                        "⚠️ Укажите один из вариантов:\n• ОСНО (с НДС)\n• УСН (без НДС)\n• Патент\n• Самозанятый (НПД)"
+                    )
+                    return
+            elif field == "carrier_type":
+                ct = value.upper().strip()
+                if "САМОЗАН" in ct or "НПД" in ct:
+                    value = "САМОЗАНЯТЫЙ"
+                elif ct in ("ИП", "ИНДИВИДУАЛЬНЫЙ ПРЕДПРИНИМАТЕЛЬ"):
+                    value = "ИП"
+                elif ct in ("ООО", "ОАО", "ЗАО", "ПАО", "АО"):
+                    value = "ООО"
+                else:
+                    bot.send_message(chat_id, "⚠️ Укажите: ИП, ООО или Самозанятый")
+                    return
+
+            scan_data[field] = value
+            session["scan_data"] = scan_data
+            del session["scan_waiting_for"]
+            save_session(chat_id, session)
+
+            bot.send_message(chat_id, f"✅ {FIELD_LABELS.get(field, field)}: {value}")
+
+            # Спрашиваем следующее поле
+            ask_scan_next_field(chat_id)
+            return
 
         if state in ("waiting_carrier_phone", "waiting_carrier_email", "waiting_carrier_bank", "waiting_carrier_flexible_input"):
             carrier_data = session.get("carrier_data") or {}
