@@ -2384,26 +2384,36 @@ def merge_extracted_into_carrier_data(session: Dict[str, Any], extracted: Dict[s
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
+    markup = InlineKeyboardMarkup()
+    btn_forms = InlineKeyboardButton("📝 Показать формы", callback_data="show_forms")
+    markup.add(btn_forms)
+
     bot.send_message(
         message.chat.id,
-        "Бот запущен.\n\n"
+        "👋 Добро пожаловать в CRM-бот <b>Фрукт Сервис</b>!\n\n"
         "Сейчас он умеет:\n"
-        "— понимать задачу\n"
+        "— создавать договоры с перевозчиками\n"
         "— подтягивать реквизиты по ИНН через DaData\n"
         "— считывать карточку предприятия с фото\n"
         "— дозапрашивать недостающие данные\n"
         "— создавать перевозчика и договор через Google Script\n\n"
-        "📋 Формы для ввода данных:\n"
-        "/добавить_перевозчика\n"
-        "/добавить_заказчика\n"
-        "/добавить_водителя\n"
-        "/добавить_машину\n"
-        "/добавить_прицеп\n"
-        "/формы — показать все формы\n\n"
+        "Доступные команды:\n"
+        "• /формы — формы для добавления данных\n"
+        "• /договор — создать договор с перевозчиком\n\n"
         "Примеры:\n"
         "1) Сделай договор новый перевозчик ИНН 381250673578\n"
-        "2) Отправь фото карточки предприятия",
+        "2) Отправь фото карточки предприятия\n\n"
+        "Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=markup,
     )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "show_forms")
+def callback_show_forms(call):
+    """Обработчик callback для кнопки 'Показать формы'."""
+    send_forms_inline(call.message.chat.id)
+    bot.answer_callback_query(call.id)
 
 
 @bot.message_handler(commands=["reset", "clear"])
@@ -2446,13 +2456,21 @@ GOOGLE_FORMS = {
 
 
 def _send_form_link(chat_id: int, entity_key: str):
-    """Отправляет ссылку на Google Form."""
+    """Отправляет inline кнопку с ссылкой на Google Form."""
     info = GOOGLE_FORMS[entity_key]
+    markup = InlineKeyboardMarkup()
+    btn = InlineKeyboardButton(
+        f"📋 Открыть форму ({info['name']})",
+        url=info["url"],
+    )
+    markup.add(btn)
     bot.send_message(
         chat_id,
-        f"📝 Форма для добавления {info['name']}\n\n"
-        f"Заполните форму по ссылке:\n{info['url']}\n\n"
+        f"📝 <b>Форма добавления {info['name']}</b>\n\n"
+        f"Нажмите кнопку ниже, чтобы открыть форму.\n"
         f"После отправки данные автоматически добавятся в базу (лист «{info['sheet']}»).",
+        parse_mode="HTML",
+        reply_markup=markup,
     )
 
 
@@ -2488,21 +2506,44 @@ def cmd_form_trailer(message):
 
 @bot.message_handler(commands=["формы"])
 def cmd_all_forms(message):
-    """Показать список всех форм."""
+    """Показать список всех форм с inline кнопками."""
     logger.info("/формы от chat_id=%s", message.chat.id)
-    lines = ["📋 *Все формы для ввода данных:*\n"]
-    for key, info in GOOGLE_FORMS.items():
-        lines.append(f"• /добавить\\_{key}а — {info['name']}" if key != "прицеп" and key != "машина" else f"• /добавить\\_{key} — {info['name']}")
-    # Simpler approach
-    lines = [
-        "📋 *Все формы для ввода данных:*\n",
-        "• /добавить\\_перевозчика",
-        "• /добавить\\_заказчика",
-        "• /добавить\\_водителя",
-        "• /добавить\\_машину",
-        "• /добавить\\_прицеп",
-    ]
-    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
+    send_forms_inline(message.chat.id)
+
+
+def send_forms_inline(chat_id: int):
+    """Отправить inline клавиатуру со всеми формами."""
+    markup = InlineKeyboardMarkup(row_width=1)
+
+    btn1 = InlineKeyboardButton(
+        "📋 Добавить перевозчика",
+        url=GOOGLE_FORMS["перевозчик"]["url"],
+    )
+    btn2 = InlineKeyboardButton(
+        "🏢 Добавить заказчика",
+        url=GOOGLE_FORMS["заказчик"]["url"],
+    )
+    btn3 = InlineKeyboardButton(
+        "👤 Добавить водителя",
+        url=GOOGLE_FORMS["водитель"]["url"],
+    )
+    btn4 = InlineKeyboardButton(
+        "🚛 Добавить машину",
+        url=GOOGLE_FORMS["машина"]["url"],
+    )
+    btn5 = InlineKeyboardButton(
+        "🚚 Добавить прицеп",
+        url=GOOGLE_FORMS["прицеп"]["url"],
+    )
+
+    markup.add(btn1, btn2, btn3, btn4, btn5)
+
+    bot.send_message(
+        chat_id,
+        "📝 <b>Формы для добавления данных в CRM:</b>\n\nВыберите нужную форму:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
 
 
 @bot.message_handler(commands=["refresh_carriers"])
