@@ -2393,6 +2393,13 @@ def handle_start(message):
         "— считывать карточку предприятия с фото\n"
         "— дозапрашивать недостающие данные\n"
         "— создавать перевозчика и договор через Google Script\n\n"
+        "📋 Формы для ввода данных:\n"
+        "/добавить_перевозчика\n"
+        "/добавить_заказчика\n"
+        "/добавить_водителя\n"
+        "/добавить_машину\n"
+        "/добавить_прицеп\n"
+        "/формы — показать все формы\n\n"
         "Примеры:\n"
         "1) Сделай договор новый перевозчик ИНН 381250673578\n"
         "2) Отправь фото карточки предприятия",
@@ -2403,6 +2410,99 @@ def handle_start(message):
 def handle_reset(message):
     clear_session(message.chat.id)
     bot.send_message(message.chat.id, "Сессия очищена.")
+
+
+# =========================
+# GOOGLE FORMS — ССЫЛКИ
+# =========================
+
+GOOGLE_FORMS = {
+    "перевозчик": {
+        "name": "перевозчика",
+        "url": "https://docs.google.com/forms/d/e/1FAIpQLScDvy8kPFMMNrXCh6nuXjHv6z6dlzM2yQLMWasAnDR4NO2gNQ/viewform",
+        "sheet": "Перевозчики",
+    },
+    "заказчик": {
+        "name": "заказчика",
+        "url": "https://docs.google.com/forms/d/e/1FAIpQLSfpbbo9dVF0tR55QuRnLJiJb0Qh0RKdQwvTd7kO6MLl36nhug/viewform",
+        "sheet": "Заказчики",
+    },
+    "водитель": {
+        "name": "водителя",
+        "url": "https://docs.google.com/forms/d/e/1FAIpQLSeXTVenX8lt4pto2bpZSvNuFqX6OLurMB2OfRTXwrlrz6QUFw/viewform",
+        "sheet": "Водители",
+    },
+    "машина": {
+        "name": "машину",
+        "url": "https://docs.google.com/forms/d/e/1FAIpQLSd6gGu1VPtj1XumDhk59ZXdBls_nfCwZV--Iz2GQxRpcQhw1A/viewform",
+        "sheet": "Машины",
+    },
+    "прицеп": {
+        "name": "прицеп",
+        "url": "https://docs.google.com/forms/d/e/1FAIpQLSfdjzsdaj0XnrKDd6r1G8AYnWPBCw02Eby1IfxFKkBgl2dA3w/viewform",
+        "sheet": "Прицепы",
+    },
+}
+
+
+def _send_form_link(chat_id: int, entity_key: str):
+    """Отправляет ссылку на Google Form."""
+    info = GOOGLE_FORMS[entity_key]
+    bot.send_message(
+        chat_id,
+        f"📝 Форма для добавления {info['name']}\n\n"
+        f"Заполните форму по ссылке:\n{info['url']}\n\n"
+        f"После отправки данные автоматически добавятся в базу (лист «{info['sheet']}»).",
+    )
+
+
+@bot.message_handler(commands=["добавить_перевозчика"])
+def cmd_form_carrier(message):
+    logger.info("/добавить_перевозчика от chat_id=%s", message.chat.id)
+    _send_form_link(message.chat.id, "перевозчик")
+
+
+@bot.message_handler(commands=["добавить_заказчика"])
+def cmd_form_customer(message):
+    logger.info("/добавить_заказчика от chat_id=%s", message.chat.id)
+    _send_form_link(message.chat.id, "заказчик")
+
+
+@bot.message_handler(commands=["добавить_водителя"])
+def cmd_form_driver(message):
+    logger.info("/добавить_водителя от chat_id=%s", message.chat.id)
+    _send_form_link(message.chat.id, "водитель")
+
+
+@bot.message_handler(commands=["добавить_машину"])
+def cmd_form_vehicle(message):
+    logger.info("/добавить_машину от chat_id=%s", message.chat.id)
+    _send_form_link(message.chat.id, "машина")
+
+
+@bot.message_handler(commands=["добавить_прицеп"])
+def cmd_form_trailer(message):
+    logger.info("/добавить_прицеп от chat_id=%s", message.chat.id)
+    _send_form_link(message.chat.id, "прицеп")
+
+
+@bot.message_handler(commands=["формы"])
+def cmd_all_forms(message):
+    """Показать список всех форм."""
+    logger.info("/формы от chat_id=%s", message.chat.id)
+    lines = ["📋 *Все формы для ввода данных:*\n"]
+    for key, info in GOOGLE_FORMS.items():
+        lines.append(f"• /добавить\\_{key}а — {info['name']}" if key != "прицеп" and key != "машина" else f"• /добавить\\_{key} — {info['name']}")
+    # Simpler approach
+    lines = [
+        "📋 *Все формы для ввода данных:*\n",
+        "• /добавить\\_перевозчика",
+        "• /добавить\\_заказчика",
+        "• /добавить\\_водителя",
+        "• /добавить\\_машину",
+        "• /добавить\\_прицеп",
+    ]
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["refresh_carriers"])
