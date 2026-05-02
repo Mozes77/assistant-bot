@@ -1595,7 +1595,43 @@ def get_carrier_name_by_id(carrier_id: str) -> str:
     return ""
 
 
-def generate_carrier_contract(carrier_id: str) -> Dict[str, Any]:
+def get_customers_for_contract() -> List[Dict[str, Any]]:
+    """Получить список активных заказчиков из Google Sheets для договора."""
+    try:
+        script_url = os.getenv("GOOGLE_SCRIPT_URL")
+        if not script_url:
+            logger.warning("GOOGLE_SCRIPT_URL не настроен для получения заказчиков")
+            return []
+
+        response = requests.post(
+            script_url,
+            json={"action": "list_customers"},
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            logger.error("HTTP ошибка при получении заказчиков: %s", response.status_code)
+            return []
+
+        data = response.json()
+
+        # Обработка обертки {ok: true, result: [...]}
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), list):
+            return data.get("result", [])
+
+        # Прямой список
+        if isinstance(data, list):
+            return data
+
+        logger.error("Неожиданный формат ответа list_customers: %s", data)
+        return []
+
+    except Exception as e:
+        logger.error("Ошибка получения списка заказчиков: %s", e, exc_info=True)
+        return []
+
+
+def generate_carrier_contract(carrier_id: str, customer_id: str = None) -> Dict[str, Any]:
     """Генерировать договор с перевозчиком через Google Apps Script."""
     try:
         from datetime import datetime
@@ -1605,33 +1641,41 @@ def generate_carrier_contract(carrier_id: str) -> Dict[str, Any]:
             logger.error("GOOGLE_SCRIPT_URL не настроен")
             return {"success": False, "error": "Сервис недоступен"}
 
-        customer_data = {
-            "name": "ООО «Фрукт Сервис»",
-            "full_name": "Общество с ограниченной ответственностью «Фрукт Сервис»",
-            "inn": "3805731231",
-            "kpp": "382701001",
-            "ogrn": "1173850020960",
-            "director": "Минин Роман Николаевич",
-            "director_short": "Р.Н. Минин",
-            "director_genitive": "Минина Романа Николаевича",
-            "address_legal": "664035, Иркутская область, г. Иркутск, Батарейная ул, дом 17, корпус 1, помещение 1",
-            "address_post": "664035, Иркутская обл, г. Иркутск, ул. Батарейная, д. 17, корп. 1, пом. 1",
-            "bank": "Байкальский Банк ПАО \"Сбербанк\"",
-            "rs": "40702810318350026308",
-            "ks": "30101810900000000607",
-            "bik": "042520607",
-            "email": "svetdrus@mail.ru",
-            "phone": "8-800-201-26-59",
-        }
-
         contract_date = datetime.now().strftime("%d.%m.%Y")
 
-        payload = {
-            "action": "generate_carrier_contract",
-            "carrier_id": carrier_id,
-            "customer_data": customer_data,
-            "contract_date": contract_date,
-        }
+        # Если передан customer_id, используем его, иначе используем дефолтные данные
+        if customer_id:
+            payload = {
+                "action": "create_contract",
+                "carrier_id": carrier_id,
+                "customer_id": customer_id,
+            }
+        else:
+            # Fallback на старый формат с жестко прописанными данными
+            customer_data = {
+                "name": "ООО «Фрукт Сервис»",
+                "full_name": "Общество с ограниченной ответственностью «Фрукт Сервис»",
+                "inn": "3805731231",
+                "kpp": "382701001",
+                "ogrn": "1173850020960",
+                "director": "Минин Роман Николаевич",
+                "director_short": "Р.Н. Минин",
+                "director_genitive": "Минина Романа Николаевича",
+                "address_legal": "664035, Иркутская область, г. Иркутск, Батарейная ул, дом 17, корпус 1, помещение 1",
+                "address_post": "664035, Иркутская обл, г. Иркутск, ул. Батарейная, д. 17, корп. 1, пом. 1",
+                "bank": "Байкальский Банк ПАО \"Сбербанк\"",
+                "rs": "40702810318350026308",
+                "ks": "30101810900000000607",
+                "bik": "042520607",
+                "email": "svetdrus@mail.ru",
+                "phone": "8-800-201-26-59",
+            }
+            payload = {
+                "action": "generate_carrier_contract",
+                "carrier_id": carrier_id,
+                "customer_data": customer_data,
+                "contract_date": contract_date,
+            }
 
         logger.info("Отправка запроса на генерацию договора: %s", payload)
         response = requests.post(
@@ -3078,18 +3122,80 @@ def cmd_make_contract(message):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("contract_carrier_"))
 def handle_contract_carrier_select(call):
-    """Обработка выбора перевозчика для договора."""
+    """Обработка выбора перевозчика для договора - показываем заказчиков."""
     chat_id = call.message.chat.id
     carrier_id = call.data.replace("contract_carrier_", "", 1)
 
     bot.answer_callback_query(call.id)
+    
+    # Сохраняем выбранного перевозчика в сессии
+    session = get_session(chat_id)
+    session["contract_carrier_id"] = carrier_id
+    session["contract_carrier_name"] = get_carrier_name_by_id(carrier_id)
+    save_session(chat_id, session)
+    
+    logger.info("Перевозчик выбран: %s (ID: %s)", session.get("contract_carrier_name"), carrier_id)
+    
+    # Получаем список заказчиков
+    customers = get_customers_for_contract()
+    
+    if not customers:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text="❌ Заказчики не найдены.\n\nОбратитесь к администратору для добавления заказчиков.",
+        )
+        return
+    
+    # Показываем кнопки с заказчиками
+    markup = InlineKeyboardMarkup()
+    for customer in customers:
+        customer_id = str(customer.get("id", "")).strip()
+        customer_name = str(customer.get("name", "")).strip() or f"ID {customer_id}"
+        
+        if not customer_id:
+            continue
+        
+        logger.info("Добавляю кнопку заказчика: %s (ID: %s)", customer_name, customer_id)
+        btn = InlineKeyboardButton(
+            text=customer_name,
+            callback_data=f"contract_customer_{customer_id}",
+        )
+        markup.add(btn)
+    
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text=f"✅ Перевозчик: {session.get('contract_carrier_name')}\n\n"
+             f"📋 Выберите заказчика:",
+        reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("contract_customer_"))
+def handle_contract_customer_select(call):
+    """Обработка выбора заказчика - генерируем договор."""
+    chat_id = call.message.chat.id
+    customer_id = call.data.replace("contract_customer_", "", 1)
+    
+    bot.answer_callback_query(call.id)
+    
+    # Получаем сохраненные данные
+    session = get_session(chat_id)
+    carrier_id = session.get("contract_carrier_id")
+    
+    if not carrier_id:
+        bot.send_message(chat_id, "❌ Ошибка: перевозчик не выбран. Начните заново с команды /договор")
+        return
+    
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=call.message.message_id,
         text="⏳ Генерирую договор...\n\nЭто может занять несколько секунд.",
     )
-
-    result = generate_carrier_contract(carrier_id)
+    
+    # Генерируем договор с указанием customer_id
+    result = generate_carrier_contract(carrier_id, customer_id)
 
     if result.get("success"):
         doc_url = result.get("url")
@@ -3107,6 +3213,9 @@ def handle_contract_carrier_select(call):
             f"Нажмите кнопку ниже чтобы открыть документ:",
             reply_markup=markup if doc_url else None,
         )
+        
+        # Очищаем сессию
+        clear_session(chat_id)
     else:
         error_msg = result.get("error", "Неизвестная ошибка")
         bot.send_message(
