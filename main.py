@@ -94,6 +94,53 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
+
+def get_main_menu_keyboard():
+    """Постоянная клавиатура с кнопкой Главное меню"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, persistent=True)
+    keyboard.add(KeyboardButton("🏠 Главное меню"))
+    return keyboard
+
+
+def show_main_menu(chat_id: int):
+    """Показать главное меню с командными кнопками"""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2, persistent=True)
+
+    # Строка 1
+    markup.add(
+        KeyboardButton("🚛 Новый перевозчик"),
+        KeyboardButton("📋 Новый договор")
+    )
+
+    # Строка 2
+    markup.add(
+        KeyboardButton("📦 Новая заявка"),
+        KeyboardButton("📄 Мои заявки")
+    )
+
+    # Строка 3
+    markup.add(
+        KeyboardButton("🚗 Добавить машину"),
+        KeyboardButton("👤 Добавить водителя")
+    )
+
+    # Строка 4
+    markup.add(
+        KeyboardButton("👥 Перевозчики"),
+        KeyboardButton("❓ Помощь")
+    )
+
+    # Кнопка главного меню всегда внизу
+    markup.add(KeyboardButton("🏠 Главное меню"))
+
+    bot.send_message(
+        chat_id,
+        "🏠 <b>Главное меню</b>\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+
+
 # =========================
 # КОНФИГ ЗАКАЗЧИКОВ
 # =========================
@@ -3093,33 +3140,20 @@ def process_scan_photo(chat_id: int, file_id: str):
 
 
 @bot.message_handler(commands=["start"])
-def handle_start(message):
-    markup = InlineKeyboardMarkup()
-    btn_forms = InlineKeyboardButton("📝 Показать формы", callback_data="show_forms")
-    markup.add(btn_forms)
+def handle_start_command(message):
+    chat_id = message.chat.id
+    clear_session(chat_id)
 
-    bot.send_message(
-        message.chat.id,
-        "👋 Добро пожаловать в CRM-бот <b>Фрукт Сервис</b>!\n\n"
-        "Сейчас он умеет:\n"
-        "— создавать договоры с перевозчиками\n"
-        "— подтягивать реквизиты по ИНН через DaData\n"
-        "— считывать карточку предприятия с фото\n"
-        "— 📸 сканировать визитки и документы с реквизитами\n"
-        "— дозапрашивать недостающие данные\n"
-        "— создавать перевозчика и договор через Google Script\n\n"
-        "Доступные команды:\n"
-        "• /сканировать — 📸 сканировать карточку предприятия\n"
-        "• /формы — формы для добавления данных\n"
-        "• /договор — создать договор с перевозчиком\n"
-        "• /отмена — отменить текущую операцию\n\n"
-        "Примеры:\n"
-        "1) Сделай договор новый перевозчик ИНН 381250673578\n"
-        "2) /сканировать → отправьте фото карточки\n\n"
-        "Выберите действие:",
-        parse_mode="HTML",
-        reply_markup=markup,
+    welcome_text = (
+        "Привет! Я бот для работы с перевозчиками.\n\n"
+        "Команды:\n"
+        "/menu — главное меню\n"
+        "/сканировать — распознать карточку\n"
+        "/помощь — справка"
     )
+
+    bot.send_message(chat_id, welcome_text)
+    show_main_menu(chat_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_forms")
@@ -4441,24 +4475,10 @@ def handle_select_driver(call):
 
 
 @bot.message_handler(commands=["menu"])
-def cmd_menu(message):
-    """Показать меню с кнопками команд."""
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        KeyboardButton("🚚 Новый перевозчик"),
-        KeyboardButton("🚛 Добавить машину"),
-        KeyboardButton("📦 Новая заявка"),
-        KeyboardButton("📋 Мои заявки"),
-        KeyboardButton("👤 Перевозчики"),
-        KeyboardButton("❓ Помощь")
-    )
-    bot.send_message(
-        message.chat.id,
-        "📱 **Меню команд:**\n\n"
-        "Выберите действие из меню ниже ⬇️",
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
+def handle_menu_command(message):
+    chat_id = message.chat.id
+    clear_session(chat_id)
+    show_main_menu(chat_id)
 
 
 @bot.message_handler(func=lambda msg: msg.text == "🚚 Новый перевозчик")
@@ -4519,6 +4539,30 @@ def menu_help(message):
         "/cancel — отменить текущее действие",
         parse_mode="Markdown"
     )
+
+
+def handle_new_carrier_command(message):
+    cmd_start_scanning(message)
+
+
+def handle_create_contract_command(message):
+    cmd_make_contract(message)
+
+
+def handle_new_order_command(message):
+    menu_new_order(message)
+
+
+def handle_my_orders_command(message):
+    menu_my_orders(message)
+
+
+def handle_list_carriers_command(message):
+    menu_carriers(message)
+
+
+def handle_help_command(message):
+    menu_help(message)
 
 
 @bot.message_handler(content_types=["photo"])
@@ -4901,10 +4945,54 @@ def handle_voice(message):
             bot.send_message(chat_id, "Не удалось обработать голосовое сообщение. Попробуйте ещё раз.")
 
 
-@bot.message_handler(content_types=["text"])
+@bot.message_handler(func=lambda message: True, content_types=['text'])
 def handle_text(message):
     chat_id = message.chat.id
-    user_text = (message.text or "").strip()
+    text = (message.text or "").strip()
+
+    # Обработка постоянной кнопки Главное меню
+    if text == "🏠 Главное меню":
+        # Очистить сессию
+        clear_session(chat_id)
+        show_main_menu(chat_id)
+        return
+
+    # Обработка кнопок главного меню
+    if text == "🚛 Новый перевозчик":
+        handle_new_carrier_command(message)
+        return
+
+    if text == "📋 Новый договор":
+        handle_create_contract_command(message)
+        return
+
+    if text == "📦 Новая заявка":
+        handle_new_order_command(message)
+        return
+
+    if text == "📄 Мои заявки":
+        handle_my_orders_command(message)
+        return
+
+    if text == "🚗 Добавить машину":
+        # TODO: реализовать добавление машины отдельно
+        bot.send_message(chat_id, "Эта функция доступна после добавления перевозчика", reply_markup=get_main_menu_keyboard())
+        return
+
+    if text == "👤 Добавить водителя":
+        # TODO: реализовать добавление водителя отдельно
+        bot.send_message(chat_id, "Эта функция доступна после добавления перевозчика", reply_markup=get_main_menu_keyboard())
+        return
+
+    if text == "👥 Перевозчики":
+        handle_list_carriers_command(message)
+        return
+
+    if text == "❓ Помощь":
+        handle_help_command(message)
+        return
+
+    user_text = text
 
     if not user_text:
         bot.send_message(chat_id, "Пустое сообщение.")
