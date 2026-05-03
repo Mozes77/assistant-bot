@@ -2512,28 +2512,26 @@ def save_carrier_to_sheets(chat_id: int) -> bool:
         logger.exception("Ошибка сохранения перевозчика в Google Sheets: %s", e)
         return False
 
-    if data.get("success"):
-        session["carrier_id"] = data.get("carrier_id", "")
-        session["carrier_save_action"] = data.get("action", "created")
-        session["carrier_save_message"] = data.get("message", "")
-        save_session(chat_id, session)
-        return True
+    # Нормализуем ответ: Apps Script может вернуть {success:...} напрямую
+    # или обёрнуто в {ok: true, result: {success:...}}
+    result = data.get("result", data) if isinstance(data, dict) else data  # fallback к корню если нет result
 
-    result = data.get("result", {}) if isinstance(data, dict) else {}
-    if data.get("ok") and isinstance(result, dict) and result.get("success"):
-        session["carrier_id"] = result.get("carrier_id", "")
-        session["carrier_save_action"] = result.get("action", "created")
-        session["carrier_save_message"] = result.get("message", "")
-        save_session(chat_id, session)
-        return True
+    if not isinstance(result, dict) or not result.get("success"):
+        error_msg = ""
+        if isinstance(result, dict):
+            error_msg = result.get("error", "")
+        if not error_msg and isinstance(data, dict):
+            error_msg = data.get("error", "")
+        error_msg = error_msg or "Неизвестная ошибка"
+        bot.send_message(chat_id, f"❌ Не удалось сохранить перевозчика: {error_msg}")
+        logger.error("Carrier save failed: %s", data)
+        return False
 
-    error_message = data.get("error") if isinstance(data, dict) else ""
-    if data.get("ok") is False and error_message:
-        logger.error("create_carrier: Apps Script ошибка: %s", error_message)
-    else:
-        logger.error("create_carrier: неожиданный ответ Google Script: %s", data)
-
-    return False
+    session["carrier_id"] = result.get("carrier_id", "")
+    session["carrier_save_action"] = result.get("action", "created")
+    session["carrier_save_message"] = result.get("message", "")
+    save_session(chat_id, session)
+    return True
 
 
 def finalize_carrier_profile(chat_id: int):
@@ -2542,10 +2540,7 @@ def finalize_carrier_profile(chat_id: int):
     save_session(chat_id, session)
 
     if not save_carrier_to_sheets(chat_id):
-        bot.send_message(
-            chat_id,
-            "❌ Не удалось сохранить перевозчика в Google Sheets. Попробуйте ещё раз позже.",
-        )
+        # Конкретная ошибка уже отправлена пользователю из save_carrier_to_sheets
         return
 
     session = get_session(chat_id)
