@@ -5826,8 +5826,10 @@ def handle_text(message):
 
 if __name__ == "__main__":
     logger.info("Бот запущен")
+    bot.delete_webhook(drop_pending_updates=True)
+    time.sleep(1)
     try:
-        bot.infinity_polling(skip_pending=True)
+        bot.infinity_polling(skip_pending=True, timeout=60)
     except Exception as e:
         logger.exception("Критическая ошибка polling: %s", e)
         raise
