@@ -5830,27 +5830,55 @@ def handle_text(message):
 # GRACEFUL SHUTDOWN
 # =========================
 
+_is_shutting_down = False
+
+
 def graceful_shutdown(signum, frame):
     """Обработчик SIGTERM для graceful shutdown при деплое Railway."""
+    global _is_shutting_down
+    _is_shutting_down = True
     logger.info("Получен сигнал %s, останавливаем бот...", signum)
     try:
         bot.stop_polling()
-    except Exception as e:
-        logger.error("Ошибка при остановке polling: %s", e)
+    except Exception:
+        pass
     logger.info("Бот остановлен gracefully")
     sys.exit(0)
+
+
+def start_polling_with_retry(max_retries: int = 5, retry_delay: int = 5):
+    """Запуск polling с повторными попытками при 409 Conflict."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info("Попытка запуска polling #%d/%d", attempt, max_retries)
+            bot.delete_webhook(drop_pending_updates=True)
+            time.sleep(2)
+            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=30)
+            break  # Нормальный выход
+        except telebot.apihelper.ApiTelegramException as e:
+            if "409" in str(e) and attempt < max_retries:
+                wait_time = retry_delay * attempt
+                logger.warning(
+                    "409 Conflict на попытке #%d. Ждём %d сек перед повтором...",
+                    attempt, wait_time,
+                )
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.exception("Критическая ошибка polling: %s", e)
+                raise
+        except Exception as e:
+            if _is_shutting_down:
+                logger.info("Polling остановлен (shutdown)")
+                break
+            logger.exception("Критическая ошибка polling: %s", e)
+            raise
 
 
 if __name__ == "__main__":
     # Регистрация signal handlers для graceful shutdown
     signal.signal(signal.SIGTERM, graceful_shutdown)
     signal.signal(signal.SIGINT, graceful_shutdown)
-    
-    logger.info("Бот запущен")
-    bot.delete_webhook(drop_pending_updates=True)
-    time.sleep(1)
-    try:
-        bot.infinity_polling(skip_pending=True, timeout=60)
-    except Exception as e:
-        logger.exception("Критическая ошибка polling: %s", e)
-        raise
+
+    logger.info("Бот запущен (polling mode)")
+    start_polling_with_retry()
