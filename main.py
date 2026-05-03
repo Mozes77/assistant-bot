@@ -16,7 +16,7 @@ from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 
 try:
@@ -2347,6 +2347,134 @@ def sync_session_with_carrier_data(session: Dict[str, Any]) -> Dict[str, Any]:
     return session
 
 
+def save_vehicle_to_sheets(chat_id: int) -> bool:
+    """Сохранить машину в Google Sheets через Apps Script."""
+    session = get_session(chat_id)
+    vehicle_data = session.get("vehicle_data", {})
+    carrier_id = session.get("vehicle_carrier_id")
+
+    if not vehicle_data or not carrier_id:
+        bot.send_message(chat_id, "❌ Ошибка: нет данных машины или перевозчика")
+        return False
+
+    url = os.getenv("GOOGLE_SCRIPT_URL")
+    if not url:
+        bot.send_message(chat_id, "❌ Ошибка: GOOGLE_SCRIPT_URL не задан")
+        return False
+
+    payload = {
+        "action": "save_vehicle",
+        "vehicle_data": {
+            "carrier_id": carrier_id,
+            "brand": vehicle_data.get("brand", ""),
+            "model": vehicle_data.get("model", ""),
+            "plate": vehicle_data.get("plate", ""),
+            "vin": vehicle_data.get("vin", ""),
+            "year": vehicle_data.get("year", ""),
+            "capacity_tons": vehicle_data.get("capacity_tons", ""),
+            "pallets": vehicle_data.get("pallets", ""),
+            "temp_regime": vehicle_data.get("temp_regime", ""),
+        }
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data, _ = safe_json_loads(response.text)
+
+        if data.get("success"):
+            vehicle_id = data.get("vehicle_id")
+            session["vehicle_id"] = vehicle_id
+            save_session(chat_id, session)
+
+            bot.send_message(
+                chat_id,
+                f"✅ Машина добавлена!\n"
+                f"Госномер: {vehicle_data.get('plate', '—')}\n"
+                f"Грузоподъёмность: {vehicle_data.get('capacity_tons', '—')} т\n"
+                f"Вместимость: {vehicle_data.get('pallets', '—')} палет"
+            )
+
+            # Спросить про прицеп
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("✅ Да", callback_data="add_trailer_yes"))
+            markup.add(InlineKeyboardButton("❌ Нет", callback_data="add_trailer_no"))
+            bot.send_message(chat_id, "Есть прицеп?", reply_markup=markup)
+            return True
+        else:
+            error = data.get("error", "Неизвестная ошибка")
+            bot.send_message(chat_id, f"❌ Не удалось сохранить машину: {error}")
+            return False
+    except Exception as e:
+        logger.exception("Ошибка сохранения машины: %s", e)
+        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        return False
+
+
+def save_trailer_to_sheets(chat_id: int) -> bool:
+    """Сохранить прицеп в Google Sheets через Apps Script."""
+    session = get_session(chat_id)
+    trailer_data = session.get("trailer_data", {})
+    vehicle_id = session.get("vehicle_id")
+    carrier_id = session.get("vehicle_carrier_id")
+
+    if not trailer_data or not carrier_id:
+        bot.send_message(chat_id, "❌ Ошибка: нет данных прицепа или перевозчика")
+        return False
+
+    url = os.getenv("GOOGLE_SCRIPT_URL")
+    if not url:
+        bot.send_message(chat_id, "❌ Ошибка: GOOGLE_SCRIPT_URL не задан")
+        return False
+
+    payload = {
+        "action": "save_trailer",
+        "trailer_data": {
+            "carrier_id": carrier_id,
+            "vehicle_id": vehicle_id or "",
+            "plate": trailer_data.get("plate", ""),
+            "brand": trailer_data.get("brand", ""),
+            "model": trailer_data.get("model", ""),
+            "capacity_tons": trailer_data.get("capacity_tons", ""),
+            "pallets": trailer_data.get("pallets", ""),
+            "temp_regime": trailer_data.get("temp_regime", ""),
+        }
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data, _ = safe_json_loads(response.text)
+
+        if data.get("success"):
+            trailer_id = data.get("trailer_id")
+            session["trailer_id"] = trailer_id
+            save_session(chat_id, session)
+
+            bot.send_message(
+                chat_id,
+                f"✅ Прицеп добавлен!\n"
+                f"Госномер: {trailer_data.get('plate', '—')}\n"
+                f"Грузоподъёмность: {trailer_data.get('capacity_tons', '—')} т\n"
+                f"Вместимость: {trailer_data.get('pallets', '—')} палет"
+            )
+
+            # Спросить про ещё одну машину
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("➕ Да, добавить ещё", callback_data=f"add_vehicle_to_carrier_{carrier_id}"))
+            markup.add(InlineKeyboardButton("✅ Нет, завершить", callback_data="cancel_vehicle_add"))
+            bot.send_message(chat_id, "Добавить ещё одну машину?", reply_markup=markup)
+            return True
+        else:
+            error = data.get("error", "Неизвестная ошибка")
+            bot.send_message(chat_id, f"❌ Не удалось сохранить прицеп: {error}")
+            return False
+    except Exception as e:
+        logger.exception("Ошибка сохранения прицепа: %s", e)
+        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        return False
+
+
 def save_carrier_to_sheets(chat_id: int) -> bool:
     session = get_session(chat_id)
     carrier_data = session.get("carrier_data") or {}
@@ -2443,6 +2571,16 @@ def finalize_carrier_profile(chat_id: int):
         f"Телефон: {carrier_data.get('phone', '—')}\n"
         f"Email: {carrier_data.get('email', '—')}"
         + (f"\n\n{save_message}" if save_message else ""),
+    )
+
+    # Предложить добавить машину
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🚛 Добавить машину", callback_data=f"add_vehicle_to_carrier_{session.get('carrier_id')}"))
+    markup.add(InlineKeyboardButton("✅ Готово", callback_data="cancel_vehicle_add"))
+    bot.send_message(
+        chat_id,
+        "Хотите добавить машину к этому перевозчику?",
+        reply_markup=markup
     )
 
 
@@ -3570,6 +3708,117 @@ def handle_vehicle_manual_entry(call):
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("add_vehicle_to_carrier_"))
+def handle_add_vehicle_to_carrier(call):
+    """Обработчик кнопки 'Добавить машину к перевозчику'."""
+    chat_id = call.message.chat.id
+    carrier_id = call.data.split("_")[-1]
+
+    session = get_session(chat_id)
+    session["vehicle_carrier_id"] = carrier_id
+    session["state"] = "waiting_vehicle_method"
+    session.pop("vehicle_data", None)
+    session.pop("trailer_data", None)
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📸 Сканировать СТС", callback_data="vehicle_scan_sts"))
+    markup.add(InlineKeyboardButton("✏️ Ввести вручную", callback_data="vehicle_manual_input"))
+
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text="Как добавить машину?\n\n📸 Сканировать СТС — я распознаю госномер, марку, модель, VIN\n✏️ Ввести вручную — напишите данные текстом",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "vehicle_scan_sts")
+def handle_vehicle_scan_sts(call):
+    """Обработчик кнопки 'Сканировать СТС' (новый flow)."""
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_vehicle_sts_photo"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "📸 Отправьте фото СТС (свидетельство о регистрации транспортного средства)\n\n"
+        "Я распознаю:\n"
+        "✅ Госномер\n"
+        "✅ Марка и модель\n"
+        "✅ VIN\n"
+        "✅ Год выпуска"
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "vehicle_manual_input")
+def handle_vehicle_manual_input(call):
+    """Обработчик кнопки 'Ввести вручную' (новый flow)."""
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_vehicle_manual_data"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "✏️ Введите данные машины:\n\n"
+        "Госномер: ...\n"
+        "Марка: ...\n"
+        "Модель: ...\n"
+        "(опционально VIN и год)"
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "cancel_vehicle_add")
+def handle_cancel_vehicle_add(call):
+    """Обработчик кнопки 'Готово' / 'Нет, завершить'."""
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = ""
+    session.pop("vehicle_data", None)
+    session.pop("trailer_data", None)
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text="✅ Готово! Используйте /menu для дальнейших действий."
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "add_trailer_yes")
+def handle_add_trailer_yes(call):
+    """Обработчик кнопки 'Да' — добавить прицеп."""
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_trailer_plate"
+    session["trailer_data"] = {}
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "🚛 Введите **госномер прицепа**:", parse_mode="Markdown")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "add_trailer_no")
+def handle_add_trailer_no(call):
+    """Обработчик кнопки 'Нет' — без прицепа."""
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+
+    bot.answer_callback_query(call.id)
+
+    # Спросить про ещё одну машину
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("➕ Да, добавить ещё", callback_data=f"add_vehicle_to_carrier_{session.get('vehicle_carrier_id')}"))
+    markup.add(InlineKeyboardButton("✅ Нет, завершить", callback_data="cancel_vehicle_add"))
+    bot.send_message(chat_id, "Добавить ещё одну машину?", reply_markup=markup)
+
+
 @bot.callback_query_handler(func=lambda call: call.data in ("carrier_manual_complete", "upload_carrier_card"))
 def handle_upload_carrier_card(call):
     chat_id = call.message.chat.id
@@ -3771,6 +4020,87 @@ def handle_select_driver(call):
     bot.answer_callback_query(call.id, "Водитель выбран")
 
 
+@bot.message_handler(commands=["menu"])
+def cmd_menu(message):
+    """Показать меню с кнопками команд."""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton("🚚 Новый перевозчик"),
+        KeyboardButton("🚛 Добавить машину"),
+        KeyboardButton("📦 Новая заявка"),
+        KeyboardButton("📋 Мои заявки"),
+        KeyboardButton("👤 Перевозчики"),
+        KeyboardButton("❓ Помощь")
+    )
+    bot.send_message(
+        message.chat.id,
+        "📱 **Меню команд:**\n\n"
+        "Выберите действие из меню ниже ⬇️",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+@bot.message_handler(func=lambda msg: msg.text == "🚚 Новый перевозчик")
+def menu_new_carrier(message):
+    """Кнопка меню: Новый перевозчик."""
+    cmd_start_scanning(message)
+
+
+@bot.message_handler(func=lambda msg: msg.text == "🚛 Добавить машину")
+def menu_add_vehicle(message):
+    """Кнопка меню: Добавить машину."""
+    start_add_vehicle_flow(message.chat.id)
+
+
+@bot.message_handler(func=lambda msg: msg.text == "📦 Новая заявка")
+def menu_new_order(message):
+    """Кнопка меню: Новая заявка."""
+    bot.send_message(message.chat.id, "📦 Опишите заявку текстом — маршрут, количество палет, температурный режим.")
+
+
+@bot.message_handler(func=lambda msg: msg.text == "📋 Мои заявки")
+def menu_my_orders(message):
+    """Кнопка меню: Мои заявки."""
+    bot.send_message(message.chat.id, "📋 Функция просмотра заявок в разработке. Скоро будет доступна!")
+
+
+@bot.message_handler(func=lambda msg: msg.text == "👤 Перевозчики")
+def menu_carriers(message):
+    """Кнопка меню: Перевозчики."""
+    bot.send_message(message.chat.id, "👤 Список перевозчиков загружается...")
+    # Можно вызвать существующую функцию показа перевозчиков
+    carriers = get_carriers_list()
+    if not carriers:
+        bot.send_message(message.chat.id, "Список перевозчиков пуст. Добавьте первого через \"🚚 Новый перевозчик\".")
+        return
+    text_lines = ["👤 **Перевозчики:**\n"]
+    for i, c in enumerate(carriers[:20], 1):
+        name = c.get("name", "—")
+        cid = c.get("id", "—")
+        text_lines.append(f"{i}. {name} (ID: {cid})")
+    bot.send_message(message.chat.id, "\n".join(text_lines), parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda msg: msg.text == "❓ Помощь")
+def menu_help(message):
+    """Кнопка меню: Помощь."""
+    bot.send_message(
+        message.chat.id,
+        "❓ **Помощь:**\n\n"
+        "🚚 **Новый перевозчик** — сканирование карточки предприятия\n"
+        "🚛 **Добавить машину** — добавить ТС к перевозчику\n"
+        "📦 **Новая заявка** — создать заявку на перевозку\n"
+        "📋 **Мои заявки** — список ваших заявок\n"
+        "👤 **Перевозчики** — список перевозчиков\n\n"
+        "Также доступны команды:\n"
+        "/scan — сканировать карточку\n"
+        "/menu — показать меню\n"
+        "/cancel — отменить текущее действие",
+        parse_mode="Markdown"
+    )
+
+
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     chat_id = message.chat.id
@@ -3834,6 +4164,37 @@ def handle_photo(message):
 
             session["state"] = ""
             save_session(chat_id, session)
+            return
+
+        # Сценарий добавления машины через СТС (новый flow — после добавления перевозчика)
+        if state == "waiting_vehicle_sts_photo":
+            bot.send_message(chat_id, "🔍 Распознаю СТС...")
+            image_bytes, download_error = download_telegram_file(file_id)
+            if download_error:
+                bot.send_message(chat_id, f"Ошибка: {download_error}")
+                return
+
+            photo_base64 = base64.b64encode(image_bytes).decode("utf-8")
+            extracted = parse_sts_document(photo_base64)
+            if not extracted:
+                bot.send_message(chat_id, "❌ Не удалось распознать СТС. Попробуйте ещё раз.")
+                return
+
+            session["vehicle_data"] = extracted
+            session["state"] = "waiting_vehicle_capacity"
+            save_session(chat_id, session)
+
+            bot.send_message(
+                chat_id,
+                f"✅ СТС распознан:\n"
+                f"Госномер: {extracted.get('plate', '—')}\n"
+                f"Марка: {extracted.get('brand', '—')}\n"
+                f"Модель: {extracted.get('model', '—')}\n"
+                f"VIN: {extracted.get('vin', '—')}\n"
+                f"Год: {extracted.get('year', '—')}\n\n"
+                f"Теперь укажите **грузоподъёмность (тонн)**:",
+                parse_mode="Markdown"
+            )
             return
 
         bot.send_message(chat_id, "Получил фото. Считываю реквизиты с карточки...")
@@ -4102,6 +4463,145 @@ def handle_text(message):
 
             # Спрашиваем следующее поле
             ask_scan_next_field(chat_id)
+            return
+
+        # === Обработка ручного ввода данных машины ===
+        if state == "waiting_vehicle_manual_data":
+            # Парсим введённые данные
+            lines = user_text.split("\n")
+            vehicle_data = {}
+            for line in lines:
+                line = line.strip()
+                if ":" in line:
+                    key, val = line.split(":", 1)
+                    key = key.strip().lower()
+                    val = val.strip()
+                    if "госномер" in key or "номер" in key:
+                        vehicle_data["plate"] = val
+                    elif "марка" in key:
+                        vehicle_data["brand"] = val
+                    elif "модель" in key:
+                        vehicle_data["model"] = val
+                    elif "vin" in key:
+                        vehicle_data["vin"] = val
+                    elif "год" in key:
+                        vehicle_data["year"] = val
+
+            if not vehicle_data.get("plate") and not vehicle_data.get("brand"):
+                bot.send_message(
+                    chat_id,
+                    "❌ Не удалось распознать данные. Введите в формате:\n\n"
+                    "Госномер: А123БВ777\n"
+                    "Марка: Volvo\n"
+                    "Модель: FH\n"
+                    "VIN: XYZ123456789\n"
+                    "Год: 2020"
+                )
+                return
+
+            session["vehicle_data"] = vehicle_data
+            session["state"] = "waiting_vehicle_capacity"
+            save_session(chat_id, session)
+
+            summary = (
+                f"✅ Данные приняты:\n"
+                f"Госномер: {vehicle_data.get('plate', '—')}\n"
+                f"Марка: {vehicle_data.get('brand', '—')}\n"
+                f"Модель: {vehicle_data.get('model', '—')}\n"
+                f"VIN: {vehicle_data.get('vin', '—')}\n"
+                f"Год: {vehicle_data.get('year', '—')}\n\n"
+                f"Теперь укажите **грузоподъёмность (тонн)**:"
+            )
+            bot.send_message(chat_id, summary, parse_mode="Markdown")
+            return
+
+        # === Дозапрос параметров машины: тонны ===
+        if state == "waiting_vehicle_capacity":
+            try:
+                capacity_tons = float(user_text.strip().replace(",", "."))
+                session["vehicle_data"]["capacity_tons"] = capacity_tons
+                session["state"] = "waiting_vehicle_pallets"
+                save_session(chat_id, session)
+                bot.send_message(chat_id, "✅ Грузоподъёмность сохранена.\n\nТеперь укажите **вместимость (европалет)**:", parse_mode="Markdown")
+            except (ValueError, TypeError):
+                bot.send_message(chat_id, "❌ Введите число (например: 20 или 20.5)")
+            return
+
+        # === Дозапрос параметров машины: палеты ===
+        if state == "waiting_vehicle_pallets":
+            try:
+                pallets = int(user_text.strip())
+                session["vehicle_data"]["pallets"] = pallets
+                session["state"] = "waiting_vehicle_temp"
+                save_session(chat_id, session)
+                bot.send_message(chat_id, "✅ Вместимость сохранена.\n\nУкажите **температурный режим** (например: -20/+20, Тент, Изотерм):", parse_mode="Markdown")
+            except (ValueError, TypeError):
+                bot.send_message(chat_id, "❌ Введите целое число")
+            return
+
+        # === Дозапрос параметров машины: температурный режим ===
+        if state == "waiting_vehicle_temp":
+            temp_regime = user_text.strip()
+            session["vehicle_data"]["temp_regime"] = temp_regime
+            session["state"] = ""
+            save_session(chat_id, session)
+
+            # Сохраняем машину в Google Sheets
+            save_vehicle_to_sheets(chat_id)
+            return
+
+        # === Обработка ввода данных прицепа ===
+        if state == "waiting_trailer_plate":
+            session["trailer_data"]["plate"] = user_text.strip()
+            session["state"] = "waiting_trailer_brand"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "Введите **марку прицепа**:", parse_mode="Markdown")
+            return
+
+        if state == "waiting_trailer_brand":
+            session["trailer_data"]["brand"] = user_text.strip()
+            session["state"] = "waiting_trailer_model"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "Введите **модель прицепа**:", parse_mode="Markdown")
+            return
+
+        if state == "waiting_trailer_model":
+            session["trailer_data"]["model"] = user_text.strip()
+            session["state"] = "waiting_trailer_capacity"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "Укажите **грузоподъёмность прицепа (тонн)**:", parse_mode="Markdown")
+            return
+
+        if state == "waiting_trailer_capacity":
+            try:
+                capacity_tons = float(user_text.strip().replace(",", "."))
+                session["trailer_data"]["capacity_tons"] = capacity_tons
+                session["state"] = "waiting_trailer_pallets"
+                save_session(chat_id, session)
+                bot.send_message(chat_id, "Укажите **вместимость прицепа (европалет)**:", parse_mode="Markdown")
+            except (ValueError, TypeError):
+                bot.send_message(chat_id, "❌ Введите число (например: 20 или 20.5)")
+            return
+
+        if state == "waiting_trailer_pallets":
+            try:
+                pallets = int(user_text.strip())
+                session["trailer_data"]["pallets"] = pallets
+                session["state"] = "waiting_trailer_temp"
+                save_session(chat_id, session)
+                bot.send_message(chat_id, "Укажите **температурный режим прицепа** (например: -20/+20, Тент, Изотерм):", parse_mode="Markdown")
+            except (ValueError, TypeError):
+                bot.send_message(chat_id, "❌ Введите целое число")
+            return
+
+        if state == "waiting_trailer_temp":
+            temp_regime = user_text.strip()
+            session["trailer_data"]["temp_regime"] = temp_regime
+            session["state"] = ""
+            save_session(chat_id, session)
+
+            # Сохраняем прицеп в Google Sheets
+            save_trailer_to_sheets(chat_id)
             return
 
         if state in ("waiting_carrier_phone", "waiting_carrier_email", "waiting_carrier_bank", "waiting_carrier_flexible_input"):
