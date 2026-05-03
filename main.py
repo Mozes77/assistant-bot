@@ -1834,6 +1834,146 @@ def parse_sts_document(photo_base64: str) -> Optional[Dict[str, str]]:
     return result
 
 
+def parse_driver_license(photo_base64: str) -> dict:
+    """
+    Парсинг водительского удостоверения через OpenAI Vision.
+    Возвращает: full_name, birth_date, license_number, categories, issue_date, expiry_date
+    """
+    if not OPENAI_API_KEY:
+        logger.warning("parse_driver_license: OPENAI_API_KEY не задан")
+        return {}
+
+    prompt_text = (
+        "Распознай водительское удостоверение РФ.\n\n"
+        "Верни JSON:\n"
+        "{\n"
+        '  "full_name": "Фамилия Имя Отчество",\n'
+        '  "birth_date": "ДД.ММ.ГГГГ",\n'
+        '  "license_number": "12 34 567890",\n'
+        '  "categories": "B,C,CE",\n'
+        '  "issue_date": "ДД.ММ.ГГГГ",\n'
+        '  "expiry_date": "ДД.ММ.ГГГГ"\n'
+        "}\n\n"
+        "Если что-то не видно — пустая строка."
+    )
+
+    payload = {
+        "model": OPENAI_CARD_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt_text},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{photo_base64}",
+                        "detail": "high",
+                    },
+                ],
+            }
+        ],
+        "store": False,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        data, error = post_json_with_handling(
+            url="https://api.openai.com/v1/responses",
+            payload=payload,
+            headers=headers,
+            timeout=OPENAI_VISION_TIMEOUT,
+            source="OpenAI DL Parser",
+        )
+        if error:
+            logger.error("parse_driver_license: %s", error)
+            return {}
+
+        output_text = extract_output_text(data)
+        parsed, parse_error = safe_json_loads(output_text)
+        if parse_error:
+            logger.error("parse_driver_license: ошибка парсинга JSON: %s", parse_error)
+            return {}
+        return parsed if parsed else {}
+    except Exception as e:
+        logger.exception("Ошибка парсинга ВУ: %s", e)
+        return {}
+
+
+def parse_passport(photo_base64: str) -> dict:
+    """
+    Парсинг паспорта РФ через OpenAI Vision.
+    Возвращает: full_name, birth_date, passport_series, passport_number,
+                issued_by, issue_date, address
+    """
+    if not OPENAI_API_KEY:
+        logger.warning("parse_passport: OPENAI_API_KEY не задан")
+        return {}
+
+    prompt_text = (
+        "Распознай паспорт гражданина РФ (разворот 2-3 или 5 страница).\n\n"
+        "Верни JSON:\n"
+        "{\n"
+        '  "full_name": "Фамилия Имя Отчество",\n'
+        '  "birth_date": "ДД.ММ.ГГГГ",\n'
+        '  "passport_series": "25 08",\n'
+        '  "passport_number": "123456",\n'
+        '  "issued_by": "Кем выдан",\n'
+        '  "issue_date": "ДД.ММ.ГГГГ",\n'
+        '  "address": "Адрес регистрации"\n'
+        "}\n\n"
+        "Если что-то не видно — пустая строка."
+    )
+
+    payload = {
+        "model": OPENAI_CARD_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt_text},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{photo_base64}",
+                        "detail": "high",
+                    },
+                ],
+            }
+        ],
+        "store": False,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        data, error = post_json_with_handling(
+            url="https://api.openai.com/v1/responses",
+            payload=payload,
+            headers=headers,
+            timeout=OPENAI_VISION_TIMEOUT,
+            source="OpenAI Passport Parser",
+        )
+        if error:
+            logger.error("parse_passport: %s", error)
+            return {}
+
+        output_text = extract_output_text(data)
+        parsed, parse_error = safe_json_loads(output_text)
+        if parse_error:
+            logger.error("parse_passport: ошибка парсинга JSON: %s", parse_error)
+            return {}
+        return parsed if parsed else {}
+    except Exception as e:
+        logger.exception("Ошибка парсинга паспорта: %s", e)
+        return {}
+
+
 def generate_vehicle_prefill_url(chat_id: int) -> str:
     """Сформировать prefill URL для формы добавления машины."""
     session = get_session(chat_id)
@@ -3790,6 +3930,158 @@ def handle_cancel_vehicle_add(call):
     )
 
 
+def ask_missing_driver_fields(chat_id: int):
+    """Дозапрос недостающих полей водителя."""
+    session = get_session(chat_id)
+    driver_data = session.get("driver_data", {})
+
+    # Проверка обязательных полей
+    if not driver_data.get("phone"):
+        session["state"] = "waiting_driver_phone"
+        save_session(chat_id, session)
+        bot.send_message(chat_id, "📞 Введите телефон водителя:")
+        return
+
+    if not driver_data.get("passport_number"):
+        session["state"] = "waiting_driver_passport_number"
+        save_session(chat_id, session)
+        bot.send_message(chat_id, "🆔 Введите серию и номер паспорта (например: 25 08 123456):")
+        return
+
+    if not driver_data.get("license_number"):
+        session["state"] = "waiting_driver_license_number"
+        save_session(chat_id, session)
+        bot.send_message(chat_id, "🚗 Введите номер водительского удостоверения:")
+        return
+
+    # Медкнижка
+    session["state"] = "waiting_driver_medical_book"
+    save_session(chat_id, session)
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Есть", callback_data="driver_medical_yes"))
+    markup.add(InlineKeyboardButton("❌ Нет", callback_data="driver_medical_no"))
+    bot.send_message(chat_id, "🏥 Есть ли медицинская книжка?", reply_markup=markup)
+
+
+def select_vehicle_for_driver(chat_id: int):
+    """Выбор машины для привязки водителя."""
+    session = get_session(chat_id)
+    carrier_id = session.get("driver_carrier_id")
+
+    if not carrier_id:
+        bot.send_message(chat_id, "❌ Ошибка: не найден ID перевозчика")
+        return
+
+    # Запросить список машин через Apps Script
+    url = os.getenv("GOOGLE_SCRIPT_URL")
+    payload = {
+        "action": "get_carrier_vehicles",
+        "carrier_id": carrier_id
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data, _ = safe_json_loads(response.text)
+        result = data.get("result", data)
+
+        if not result.get("success"):
+            bot.send_message(chat_id, "❌ Не удалось получить список машин")
+            return
+
+        vehicles = result.get("vehicles", [])
+
+        if not vehicles:
+            bot.send_message(chat_id, "У этого перевозчика пока нет машин. Сохраняю водителя без привязки к машине.")
+            save_driver_to_sheets(chat_id, vehicle_id=None)
+            return
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        for v in vehicles:
+            plate = v.get("plate", "")
+            brand = v.get("brand", "")
+            model = v.get("model", "")
+            vehicle_id = v.get("vehicle_id", "")
+            text = f"{plate} — {brand} {model}"
+            markup.add(InlineKeyboardButton(text, callback_data=f"assign_driver_vehicle_{vehicle_id}"))
+
+        markup.add(InlineKeyboardButton("⏭ Пропустить (без машины)", callback_data="assign_driver_vehicle_none"))
+
+        bot.send_message(chat_id, "🚛 Выберите машину для водителя:", reply_markup=markup)
+
+    except Exception as e:
+        logger.exception("Ошибка получения списка машин: %s", e)
+        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+
+
+def save_driver_to_sheets(chat_id: int, vehicle_id: str = None) -> bool:
+    """Сохранение водителя в Google Sheets через Apps Script."""
+    session = get_session(chat_id)
+    driver_data = session.get("driver_data", {})
+    carrier_id = session.get("driver_carrier_id")
+
+    if not driver_data or not carrier_id:
+        bot.send_message(chat_id, "❌ Ошибка: нет данных водителя или перевозчика")
+        return False
+
+    url = os.getenv("GOOGLE_SCRIPT_URL")
+    payload = {
+        "action": "save_driver",
+        "driver_data": {
+            "carrier_id": carrier_id,
+            "vehicle_id": vehicle_id or "",
+            "full_name": driver_data.get("full_name", ""),
+            "phone": driver_data.get("phone", ""),
+            "birth_date": driver_data.get("birth_date", ""),
+            "passport_number": driver_data.get("passport_number", ""),
+            "passport_issued_by": driver_data.get("passport_issued_by", ""),
+            "passport_issue_date": driver_data.get("passport_issue_date", ""),
+            "address": driver_data.get("address", ""),
+            "license_number": driver_data.get("license_number", ""),
+            "license_categories": driver_data.get("categories", ""),
+            "license_issue_date": driver_data.get("issue_date", ""),
+            "license_expiry_date": driver_data.get("expiry_date", ""),
+            "medical_book": driver_data.get("medical_book", "Нет"),
+            "medical_book_expiry": driver_data.get("medical_book_expiry", ""),
+        }
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data, _ = safe_json_loads(response.text)
+        result = data.get("result", data)
+
+        if not result.get("success"):
+            error_msg = result.get("error", "Неизвестная ошибка")
+            bot.send_message(chat_id, f"❌ Не удалось сохранить водителя: {error_msg}")
+            logger.error("Driver save failed: %s", data)
+            return False
+
+        driver_id = result.get("driver_id")
+        driver_name = result.get("driver_name", driver_data.get("full_name", ""))
+
+        bot.send_message(
+            chat_id,
+            f"✅ Водитель добавлен!\n"
+            f"ФИО: {driver_name}\n"
+            f"Телефон: {driver_data.get('phone', '—')}\n"
+            f"ВУ: {driver_data.get('license_number', '—')}"
+        )
+
+        # Спросить про ещё водителя
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("➕ Добавить ещё водителя", callback_data=f"add_driver_to_carrier_{carrier_id}"))
+        markup.add(InlineKeyboardButton("✅ Завершить", callback_data="finish_carrier_setup"))
+        bot.send_message(chat_id, "Добавить ещё водителя?", reply_markup=markup)
+        return True
+
+    except Exception as e:
+        logger.exception("Ошибка сохранения водителя: %s", e)
+        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        return False
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("add_driver_to_carrier_"))
 def handle_add_driver_to_carrier(call):
     chat_id = call.message.chat.id
@@ -3797,20 +4089,119 @@ def handle_add_driver_to_carrier(call):
 
     session = get_session(chat_id)
     session["driver_carrier_id"] = carrier_id
+    session["driver_data"] = {}
     session["state"] = "waiting_driver_method"
     save_session(chat_id, session)
 
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("📸 Сканировать ВУ", callback_data="driver_scan_license"))
-    markup.add(InlineKeyboardButton("✏️ Ввести вручную", callback_data="driver_manual_input"))
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("📸 Сканировать ВУ", callback_data="driver_scan_license"),
+        InlineKeyboardButton("📄 Сканировать паспорт", callback_data="driver_scan_passport"),
+        InlineKeyboardButton("✏️ Ввести вручную", callback_data="driver_manual_input")
+    )
 
     bot.answer_callback_query(call.id)
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=call.message.message_id,
-        text="Как добавить водителя?\n\n📸 Сканировать ВУ — я распознаю ФИО, номер ВУ, дату рождения\n✏️ Ввести вручную — напишите данные",
+        text=(
+            "Как добавить водителя?\n\n"
+            "📸 Сканировать ВУ — распознаю ФИО, дату рождения, номер ВУ, категории, сроки\n"
+            "📄 Сканировать паспорт — распознаю паспортные данные, адрес\n"
+            "✏️ Ввести вручную — запрошу все поля по очереди"
+        ),
         reply_markup=markup
     )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "driver_scan_license")
+def handle_driver_scan_license(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_driver_license_photo"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "📸 Отправьте фото водительского удостоверения (ВУ)\n\n"
+        "Я распознаю: ФИО, дату рождения, номер ВУ, категории, даты выдачи и окончания"
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "driver_scan_passport")
+def handle_driver_scan_passport(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_driver_passport_photo"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "📄 Отправьте фото паспорта (разворот 2-3 или страница с пропиской)\n\n"
+        "Я распознаю: ФИО, дату рождения, серию/номер, кем выдан, дату выдачи, адрес"
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "driver_manual_input")
+def handle_driver_manual_input(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_driver_full_name"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "✏️ Введите ФИО полностью (Фамилия Имя Отчество):")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "ask_passport_manual")
+def handle_ask_passport_manual(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_driver_passport_number"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "🆔 Введите серию и номер паспорта (например: 25 08 123456):")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "driver_medical_yes")
+def handle_driver_medical_yes(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["driver_data"]["medical_book"] = "Да"
+    session["state"] = "waiting_driver_medical_expiry"
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "📅 Введите срок действия медкнижки (ДД.ММ.ГГГГ):")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "driver_medical_no")
+def handle_driver_medical_no(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["driver_data"]["medical_book"] = "Нет"
+    session["driver_data"]["medical_book_expiry"] = ""
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id)
+
+    # Привязка к машине
+    select_vehicle_for_driver(chat_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("assign_driver_vehicle_"))
+def handle_assign_driver_vehicle(call):
+    chat_id = call.message.chat.id
+    vehicle_id = call.data.replace("assign_driver_vehicle_", "")
+
+    if vehicle_id == "none":
+        vehicle_id = None
+
+    bot.answer_callback_query(call.id)
+    save_driver_to_sheets(chat_id, vehicle_id=vehicle_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "finish_carrier_setup")
@@ -4226,6 +4617,100 @@ def handle_photo(message):
             )
             return
 
+        # --- Сканирование ВУ водителя ---
+        if state == "waiting_driver_license_photo":
+            bot.send_message(chat_id, "🔍 Распознаю водительское удостоверение...")
+            image_bytes, download_error = download_telegram_file(file_id)
+            if download_error:
+                bot.send_message(chat_id, f"Ошибка загрузки: {download_error}")
+                return
+
+            photo_base64 = base64.b64encode(image_bytes).decode("utf-8")
+            extracted = parse_driver_license(photo_base64)
+
+            if not extracted:
+                bot.send_message(chat_id, "❌ Не удалось распознать ВУ. Попробуйте ещё раз.")
+                return
+
+            session["driver_data"].update(extracted)
+            save_session(chat_id, session)
+
+            # Показать распознанное
+            msg = (
+                f"✅ ВУ распознано:\n"
+                f"ФИО: {extracted.get('full_name', '—')}\n"
+                f"Дата рождения: {extracted.get('birth_date', '—')}\n"
+                f"Номер ВУ: {extracted.get('license_number', '—')}\n"
+                f"Категории: {extracted.get('categories', '—')}\n"
+                f"Выдано: {extracted.get('issue_date', '—')}\n"
+                f"Действительно до: {extracted.get('expiry_date', '—')}\n\n"
+            )
+
+            # Проверить чего не хватает
+            if not extracted.get('full_name') or not extracted.get('birth_date'):
+                bot.send_message(chat_id, msg + "❓ Нужны паспортные данные. Отправьте фото паспорта или введите вручную.")
+                session["state"] = "waiting_driver_passport_or_manual"
+                save_session(chat_id, session)
+
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("📄 Сканировать паспорт", callback_data="driver_scan_passport"))
+                markup.add(InlineKeyboardButton("✏️ Ввести вручную", callback_data="ask_passport_manual"))
+                bot.send_message(chat_id, "Выберите способ:", reply_markup=markup)
+            else:
+                bot.send_message(chat_id, msg + "Теперь отправьте фото паспорта или введите паспортные данные.")
+                session["state"] = "waiting_driver_passport_photo"
+                save_session(chat_id, session)
+            return
+
+        # --- Сканирование паспорта водителя ---
+        if state == "waiting_driver_passport_photo":
+            bot.send_message(chat_id, "🔍 Распознаю паспорт...")
+            image_bytes, download_error = download_telegram_file(file_id)
+            if download_error:
+                bot.send_message(chat_id, f"Ошибка загрузки: {download_error}")
+                return
+
+            photo_base64 = base64.b64encode(image_bytes).decode("utf-8")
+            extracted = parse_passport(photo_base64)
+
+            if not extracted:
+                bot.send_message(chat_id, "❌ Не удалось распознать паспорт. Попробуйте ещё раз.")
+                return
+
+            # Объединить с данными ВУ
+            driver_data = session.get("driver_data", {})
+
+            # Паспортные данные
+            passport_full = f"{extracted.get('passport_series', '')} {extracted.get('passport_number', '')}".strip()
+            driver_data["passport_number"] = passport_full
+            driver_data["passport_issued_by"] = extracted.get("issued_by", "")
+            driver_data["passport_issue_date"] = extracted.get("issue_date", "")
+            driver_data["address"] = extracted.get("address", "")
+
+            # ФИО и дата рождения из паспорта приоритетнее
+            if extracted.get("full_name"):
+                driver_data["full_name"] = extracted.get("full_name")
+            if extracted.get("birth_date"):
+                driver_data["birth_date"] = extracted.get("birth_date")
+
+            session["driver_data"] = driver_data
+            save_session(chat_id, session)
+
+            msg = (
+                f"✅ Паспорт распознан:\n"
+                f"ФИО: {driver_data.get('full_name', '—')}\n"
+                f"Дата рождения: {driver_data.get('birth_date', '—')}\n"
+                f"Паспорт: {passport_full}\n"
+                f"Кем выдан: {driver_data.get('passport_issued_by', '—')}\n"
+                f"Дата выдачи: {driver_data.get('passport_issue_date', '—')}\n"
+                f"Адрес: {driver_data.get('address', '—')}\n\n"
+            )
+            bot.send_message(chat_id, msg)
+
+            # Дозапросить недостающие поля
+            ask_missing_driver_fields(chat_id)
+            return
+
         bot.send_message(chat_id, "Получил фото. Считываю реквизиты с карточки...")
 
         image_bytes, download_error = download_telegram_file(file_id)
@@ -4631,6 +5116,86 @@ def handle_text(message):
 
             # Сохраняем прицеп в Google Sheets
             save_trailer_to_sheets(chat_id)
+            return
+
+        # --- Ручной ввод данных водителя ---
+        if state == "waiting_driver_full_name":
+            session["driver_data"]["full_name"] = user_text.strip()
+            session["state"] = "waiting_driver_birth_date"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "📅 Введите дату рождения (ДД.ММ.ГГГГ):")
+            return
+
+        if state == "waiting_driver_birth_date":
+            session["driver_data"]["birth_date"] = user_text.strip()
+            save_session(chat_id, session)
+            ask_missing_driver_fields(chat_id)
+            return
+
+        if state == "waiting_driver_phone":
+            session["driver_data"]["phone"] = user_text.strip()
+            save_session(chat_id, session)
+            ask_missing_driver_fields(chat_id)
+            return
+
+        if state == "waiting_driver_passport_number":
+            session["driver_data"]["passport_number"] = user_text.strip()
+            session["state"] = "waiting_driver_passport_issued_by"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "🏛 Введите кем выдан паспорт:")
+            return
+
+        if state == "waiting_driver_passport_issued_by":
+            session["driver_data"]["passport_issued_by"] = user_text.strip()
+            session["state"] = "waiting_driver_passport_issue_date"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "📅 Введите дату выдачи паспорта (ДД.ММ.ГГГГ):")
+            return
+
+        if state == "waiting_driver_passport_issue_date":
+            session["driver_data"]["passport_issue_date"] = user_text.strip()
+            session["state"] = "waiting_driver_address"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "🏠 Введите адрес регистрации (прописка):")
+            return
+
+        if state == "waiting_driver_address":
+            session["driver_data"]["address"] = user_text.strip()
+            save_session(chat_id, session)
+            ask_missing_driver_fields(chat_id)
+            return
+
+        if state == "waiting_driver_license_number":
+            session["driver_data"]["license_number"] = user_text.strip()
+            session["state"] = "waiting_driver_license_categories"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "🚗 Введите категории прав (например: B,C,CE):")
+            return
+
+        if state == "waiting_driver_license_categories":
+            session["driver_data"]["categories"] = user_text.strip()
+            session["state"] = "waiting_driver_license_issue_date"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "📅 Введите дату выдачи прав (ДД.ММ.ГГГГ):")
+            return
+
+        if state == "waiting_driver_license_issue_date":
+            session["driver_data"]["issue_date"] = user_text.strip()
+            session["state"] = "waiting_driver_license_expiry"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "📅 Введите срок действия прав (ДД.ММ.ГГГГ):")
+            return
+
+        if state == "waiting_driver_license_expiry":
+            session["driver_data"]["expiry_date"] = user_text.strip()
+            save_session(chat_id, session)
+            ask_missing_driver_fields(chat_id)
+            return
+
+        if state == "waiting_driver_medical_expiry":
+            session["driver_data"]["medical_book_expiry"] = user_text.strip()
+            save_session(chat_id, session)
+            select_vehicle_for_driver(chat_id)
             return
 
         if state in ("waiting_carrier_phone", "waiting_carrier_email", "waiting_carrier_bank", "waiting_carrier_flexible_input"):
