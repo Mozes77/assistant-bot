@@ -1,4 +1,6 @@
+[deploy.multiRegionConfig.us-west2]
+numReplicas = 1
+
 [deploy]
-replicas = 1
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
