@@ -96,7 +96,6 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 
 def get_main_keyboard():
-    """Постоянная клавиатура главного меню"""
     markup = ReplyKeyboardMarkup(resize_keyboard=True, persistent=True)
     markup.row(KeyboardButton("🏠 Главное меню"))
     markup.row(
@@ -3144,7 +3143,7 @@ def handle_start_command(message):
         "/помощь — справка"
     )
 
-    bot.send_message(chat_id, welcome_text)
+    bot.send_message(chat_id, welcome_text, reply_markup=get_main_keyboard())
     show_main_menu(chat_id)
 
 
@@ -4938,19 +4937,27 @@ def handle_voice(message):
 
 
 @bot.message_handler(func=lambda m: m.text == "📋 Новый договор")
-def handle_menu_new_contract(message):
-    """Обработчик кнопки Новый договор"""
+def handle_btn_new_contract(message):
     cmd_make_contract(message)
 
 
 @bot.message_handler(func=lambda m: m.text == "👤 Добавить водителя")
-def handle_menu_add_driver(message):
-    """Обработчик кнопки Добавить водителя"""
-    ask_carrier_for_driver(message.chat.id)
+def handle_btn_add_driver(message):
+    start_add_driver_flow(message.chat.id)
 
 
-def ask_carrier_for_driver(chat_id: int):
-    """Показать выбор перевозчика для добавления водителя"""
+@bot.message_handler(func=lambda m: m.text == "🏠 Главное меню")
+def handle_btn_main_menu(message):
+    clear_session(message.chat.id)
+    bot.send_message(
+        message.chat.id,
+        "🏠 Главное меню",
+        reply_markup=get_main_keyboard()
+    )
+
+
+def start_add_driver_flow(chat_id: int):
+    """Начать процесс добавления водителя - показать список перевозчиков"""
     session = get_session(chat_id)
     session["state"] = "selecting_carrier_for_driver"
     save_session(chat_id, session)
