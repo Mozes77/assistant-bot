@@ -2568,13 +2568,17 @@ def finalize_carrier_profile(chat_id: int):
         + (f"\n\n{save_message}" if save_message else ""),
     )
 
-    # Предложить добавить машину
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🚛 Добавить машину", callback_data=f"add_vehicle_to_carrier_{session.get('carrier_id')}"))
-    markup.add(InlineKeyboardButton("✅ Готово", callback_data="cancel_vehicle_add"))
+    # Предложить добавить машину и водителя
+    carrier_id = session.get('carrier_id', '')
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🚛 Добавить машину", callback_data=f"add_vehicle_to_carrier_{carrier_id}"),
+        InlineKeyboardButton("👤 Добавить водителя", callback_data=f"add_driver_to_carrier_{carrier_id}"),
+        InlineKeyboardButton("✅ Готово, завершить", callback_data="finish_carrier_setup")
+    )
     bot.send_message(
         chat_id,
-        "Хотите добавить машину к этому перевозчику?",
+        "Хотите добавить транспорт и водителей к этому перевозчику?",
         reply_markup=markup
     )
 
@@ -3784,6 +3788,36 @@ def handle_cancel_vehicle_add(call):
         message_id=call.message.message_id,
         text="✅ Готово! Используйте /menu для дальнейших действий."
     )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("add_driver_to_carrier_"))
+def handle_add_driver_to_carrier(call):
+    chat_id = call.message.chat.id
+    carrier_id = call.data.split("_")[-1]
+
+    session = get_session(chat_id)
+    session["driver_carrier_id"] = carrier_id
+    session["state"] = "waiting_driver_method"
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📸 Сканировать ВУ", callback_data="driver_scan_license"))
+    markup.add(InlineKeyboardButton("✏️ Ввести вручную", callback_data="driver_manual_input"))
+
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text="Как добавить водителя?\n\n📸 Сканировать ВУ — я распознаю ФИО, номер ВУ, дату рождения\n✏️ Ввести вручную — напишите данные",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "finish_carrier_setup")
+def handle_finish_carrier_setup(call):
+    chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "✅ Настройка перевозчика завершена!")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_trailer_yes")
