@@ -9,6 +9,8 @@ import time
 import tempfile
 import subprocess
 import shutil
+import signal
+import sys
 from urllib.parse import urlencode, quote
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -5824,7 +5826,26 @@ def handle_text(message):
         )
 
 
+# =========================
+# GRACEFUL SHUTDOWN
+# =========================
+
+def graceful_shutdown(signum, frame):
+    """Обработчик SIGTERM для graceful shutdown при деплое Railway."""
+    logger.info("Получен сигнал %s, останавливаем бот...", signum)
+    try:
+        bot.stop_polling()
+    except Exception as e:
+        logger.error("Ошибка при остановке polling: %s", e)
+    logger.info("Бот остановлен gracefully")
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    # Регистрация signal handlers для graceful shutdown
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
+    
     logger.info("Бот запущен")
     bot.delete_webhook(drop_pending_updates=True)
     time.sleep(1)
