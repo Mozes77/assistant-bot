@@ -487,6 +487,41 @@ def get_company_by_inn(inn: str) -> Tuple[Dict[str, Any], str]:
     }, ""
 
 
+def get_bank_by_bik(bik: str) -> Tuple[Dict[str, Any], str]:
+    """Получить данные банка по БИК через DaData."""
+    if not DADATA_TOKEN:
+        return {}, "DaData не настроен."
+    bik = clean_digits(bik or "")
+    if len(bik) != 9:
+        return {}, "БИК должен содержать 9 цифр."
+
+    url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/bank"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Token {DADATA_TOKEN}",
+    }
+    payload = {"query": bik}
+
+    data, error = post_json_with_handling(
+        url=url, payload=payload, headers=headers,
+        timeout=DADATA_TIMEOUT, source="DaData Bank",
+    )
+    if error:
+        return {}, error
+
+    suggestions = data.get("suggestions", [])
+    if not suggestions:
+        return {}, "Банк не найден по БИК."
+
+    bank_data = suggestions[0].get("data", {})
+    return {
+        "bank_name": bank_data.get("name", {}).get("payment") or bank_data.get("name", {}).get("short") or "",
+        "ks": bank_data.get("correspondent_account") or "",
+        "bik": bank_data.get("bic") or bik,
+    }, ""
+
+
 # =========================
 # OPENAI ROUTER
 # =========================
@@ -757,7 +792,10 @@ def parse_company_card(content: Any, source_type: str = "image") -> Tuple[Dict[s
         "emails, bank, bank_city, account, rs, corr_account, ks, bik, tax_mode, edo.\n\n"
         "Правила:\n"
         "- carrier_type: только ИП / ООО / САМОЗАНЯТЫЙ\n"
-        "- ИНН, КПП, ОГРН/ОГРНИП, БИК, р/с, к/с возвращай строками\n"
+        "- ИНН, КПП, ОГРН/ОГРНИП, БИК, р/с, к/с — возвращай строками из ЦИФР\n"
+        "- ВАЖНО: Расчётный счёт (р/с, account, rs) и Корреспондентский счёт (к/с, кор/с, corr_account, ks) — это ДВА РАЗНЫХ поля! "
+        "Оба содержат ровно 20 цифр. Р/с обычно начинается на 407 или 408. К/с начинается на 301. "
+        "Обязательно найди ОБА счёта!\n"
         "- phone и email — основные, phone2/emails можно заполнить дополнительными значениями\n"
         "- Если найдено ФИО ИП, можно дублировать его в director\n"
         "- Ничего кроме JSON"
@@ -2206,11 +2244,22 @@ def apply_extracted_carrier_data(chat_id: int, extracted: Dict[str, Any], source
     session["email"] = extracted.get("email", "")
     session["bank"] = extracted.get("bank", "")
     session["rs"] = clean_digits(extracted.get("rs", ""))
-    session["ks"] = clean_digits(extracted.get("ks", ""))
+    session["ks"] = clean_digits(extracted.get("corr_account", "") or extracted.get("ks", ""))
     session["bik"] = clean_digits(extracted.get("bik", ""))
     session["director"] = extracted.get("director", "")
     session["customer_name"] = session.get("customer_name", "")
     session["tax_mode"] = session.get("tax_mode", "")
+
+    # Автозаполнение к/с по БИК через DaData если к/с не распознан
+    if session.get("bik") and not session.get("ks"):
+        logger.info("К/с не распознан, пробую получить по БИК %s через DaData", session["bik"])
+        bank_info, bank_err = get_bank_by_bik(session["bik"])
+        if not bank_err and bank_info.get("ks"):
+            session["ks"] = bank_info["ks"]
+            logger.info("К/с получен по БИК: %s", session["ks"])
+            # Также обогатим название банка если не распознано
+            if not session.get("bank") and bank_info.get("bank_name"):
+                session["bank"] = bank_info["bank_name"]
 
     save_session(chat_id, session)
 
@@ -2278,6 +2327,16 @@ def sync_session_with_carrier_data(session: Dict[str, Any]) -> Dict[str, Any]:
     session["rs"] = clean_digits(carrier_data.get("account", carrier_data.get("rs", session.get("rs", ""))))
     session["ks"] = clean_digits(carrier_data.get("corr_account", carrier_data.get("ks", session.get("ks", ""))))
     session["bik"] = clean_digits(carrier_data.get("bik", session.get("bik", "")))
+
+    # Автозаполнение к/с по БИК если к/с отсутствует
+    if session.get("bik") and not session.get("ks"):
+        bank_info, _ = get_bank_by_bik(session["bik"])
+        if bank_info.get("ks"):
+            session["ks"] = bank_info["ks"]
+            carrier_data["corr_account"] = bank_info["ks"]
+            if not session.get("bank") and bank_info.get("bank_name"):
+                session["bank"] = bank_info["bank_name"]
+                carrier_data["bank"] = bank_info["bank_name"]
 
     tax_mode = normalize_tax_mode(carrier_data.get("tax_mode", session.get("tax_mode", "")))
     if tax_mode:
