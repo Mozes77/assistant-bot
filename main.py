@@ -95,49 +95,41 @@ if not TELEGRAM_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 
+def get_main_keyboard():
+    """Постоянная клавиатура главного меню"""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, persistent=True)
+    markup.row(KeyboardButton("🏠 Главное меню"))
+    markup.row(
+        KeyboardButton("🚛 Новый перевозчик"),
+        KeyboardButton("📋 Новый договор")
+    )
+    markup.row(
+        KeyboardButton("📦 Новая заявка"),
+        KeyboardButton("📄 Мои заявки")
+    )
+    markup.row(
+        KeyboardButton("🚗 Добавить машину"),
+        KeyboardButton("👤 Добавить водителя")
+    )
+    markup.row(
+        KeyboardButton("👥 Перевозчики"),
+        KeyboardButton("❓ Помощь")
+    )
+    return markup
+
+
 def get_main_menu_keyboard():
-    """Постоянная клавиатура с кнопкой Главное меню"""
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, persistent=True)
-    keyboard.add(KeyboardButton("🏠 Главное меню"))
-    return keyboard
+    """Совместимость со старыми вызовами."""
+    return get_main_keyboard()
 
 
 def show_main_menu(chat_id: int):
     """Показать главное меню с командными кнопками"""
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2, persistent=True)
-
-    # Строка 1
-    markup.add(
-        KeyboardButton("🚛 Новый перевозчик"),
-        KeyboardButton("📋 Новый договор")
-    )
-
-    # Строка 2
-    markup.add(
-        KeyboardButton("📦 Новая заявка"),
-        KeyboardButton("📄 Мои заявки")
-    )
-
-    # Строка 3
-    markup.add(
-        KeyboardButton("🚗 Добавить машину"),
-        KeyboardButton("👤 Добавить водителя")
-    )
-
-    # Строка 4
-    markup.add(
-        KeyboardButton("👥 Перевозчики"),
-        KeyboardButton("❓ Помощь")
-    )
-
-    # Кнопка главного меню всегда внизу
-    markup.add(KeyboardButton("🏠 Главное меню"))
-
     bot.send_message(
         chat_id,
         "🏠 <b>Главное меню</b>\n\nВыберите действие:",
         parse_mode="HTML",
-        reply_markup=markup
+        reply_markup=get_main_keyboard()
     )
 
 
@@ -4943,6 +4935,99 @@ def handle_voice(message):
         except Exception as e:
             logger.exception("Ошибка обработки voice: %s", e)
             bot.send_message(chat_id, "Не удалось обработать голосовое сообщение. Попробуйте ещё раз.")
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 Новый договор")
+def handle_menu_new_contract(message):
+    """Обработчик кнопки Новый договор"""
+    cmd_make_contract(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "👤 Добавить водителя")
+def handle_menu_add_driver(message):
+    """Обработчик кнопки Добавить водителя"""
+    ask_carrier_for_driver(message.chat.id)
+
+
+def ask_carrier_for_driver(chat_id: int):
+    """Показать выбор перевозчика для добавления водителя"""
+    session = get_session(chat_id)
+    session["state"] = "selecting_carrier_for_driver"
+    save_session(chat_id, session)
+
+    url = os.getenv("GOOGLE_SCRIPT_URL")
+    payload = {"action": "list_carriers"}
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data, _ = safe_json_loads(response.text)
+        result = data.get("result", data)
+
+        if not result.get("success"):
+            bot.send_message(chat_id, "❌ Не удалось получить список перевозчиков", reply_markup=get_main_keyboard())
+            return
+
+        carriers = result.get("carriers", [])
+
+        if not carriers:
+            bot.send_message(
+                chat_id,
+                "📋 У вас пока нет перевозчиков.\n\nСначала добавьте перевозчика через 🚛 Новый перевозчик",
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        for carrier in carriers:
+            carrier_id = carrier.get("id", "")
+            name = carrier.get("name", "")
+            inn = carrier.get("inn", "")
+            text = f"{name} (ИНН: {inn})"
+            markup.add(InlineKeyboardButton(text, callback_data=f"select_carrier_for_driver_{carrier_id}"))
+
+        bot.send_message(
+            chat_id,
+            "👤 Выберите перевозчика для добавления водителя:",
+            reply_markup=markup
+        )
+
+    except Exception as e:
+        logger.exception("Ошибка получения списка перевозчиков: %s", e)
+        bot.send_message(chat_id, f"❌ Ошибка: {e}", reply_markup=get_main_keyboard())
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("select_carrier_for_driver_"))
+def handle_select_carrier_for_driver(call):
+    """Обработка выбора перевозчика для водителя"""
+    chat_id = call.message.chat.id
+    carrier_id = call.data.replace("select_carrier_for_driver_", "")
+
+    session = get_session(chat_id)
+    session["driver_carrier_id"] = carrier_id
+    session["driver_data"] = {}
+    session["state"] = "waiting_driver_method"
+    save_session(chat_id, session)
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("📸 Сканировать ВУ", callback_data="driver_scan_license"),
+        InlineKeyboardButton("📄 Сканировать паспорт", callback_data="driver_scan_passport"),
+        InlineKeyboardButton("✏️ Ввести вручную", callback_data="driver_manual_input")
+    )
+
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text=(
+            "Как добавить водителя?\n\n"
+            "📸 Сканировать ВУ — распознаю ФИО, дату рождения, номер ВУ, категории, сроки\n"
+            "📄 Сканировать паспорт — распознаю паспортные данные, адрес\n"
+            "✏️ Ввести вручную — запрошу все поля по очереди"
+        ),
+        reply_markup=markup
+    )
 
 
 @bot.message_handler(func=lambda message: True, content_types=['text'])
