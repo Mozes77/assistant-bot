@@ -5138,6 +5138,64 @@ def handle_text(message):
         session = get_session(chat_id)
         state = session.get("state", "")
 
+        if state == "waiting_sts_photo" and user_text:
+            bot.send_message(chat_id, "🔍 Распознаю данные машины из текста...")
+            
+            payload = {
+                "model": OPENAI_CARD_MODEL,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Извлеки данные транспортного средства из текста. "
+                            "Верни строго JSON без markdown:\n"
+                            '{"plate":"","brand":"","model":"","vin":"","year":"",'
+                            '"trailer_plate":"","trailer_brand":""}\n\n'
+                            f"Текст: {user_text}"
+                        )
+                    }
+                ],
+                "store": False,
+            }
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            data, error = post_json_with_handling(
+                url="https://api.openai.com/v1/responses",
+                payload=payload,
+                headers=headers,
+                timeout=OPENAI_ROUTER_TIMEOUT,
+                source="OpenAI Vehicle Parser",
+            )
+            if not error:
+                output_text = extract_output_text(data)
+                extracted, parse_error = safe_json_loads(output_text)
+                if not parse_error and extracted:
+                    session["vehicle_data"] = extracted
+                    session["state"] = ""
+                    save_session(chat_id, session)
+                    
+                    summary = (
+                        f"✅ Данные распознаны:\n\n"
+                        f"🚗 Марка: {extracted.get('brand','—') or '—'}\n"
+                        f"📋 Модель: {extracted.get('model','—') or '—'}\n"
+                        f"🔢 Госномер: {extracted.get('plate','—') or '—'}\n"
+                        f"🔑 VIN: {extracted.get('vin','—') or '—'}\n"
+                        f"📅 Год: {extracted.get('year','—') or '—'}\n"
+                    )
+                    if extracted.get('trailer_plate'):
+                        summary += f"🚛 Прицеп: {extracted.get('trailer_plate','—')}\n"
+                    
+                    prefill_url = generate_vehicle_prefill_url(chat_id)
+                    markup = InlineKeyboardMarkup()
+                    markup.add(InlineKeyboardButton("📝 Открыть форму", url=prefill_url))
+                    bot.send_message(chat_id, summary + "\nДополните остальные данные в форме:", reply_markup=markup)
+                    return
+    
+            bot.send_message(chat_id, "❌ Не удалось распознать. Попробуйте фото СТС или заполните форму вручную.")
+            return
+
         # Обработка ввода поля в режиме сканирования
         if state == "scan_waiting_field" and session.get("scan_waiting_for"):
             field = session["scan_waiting_for"]
