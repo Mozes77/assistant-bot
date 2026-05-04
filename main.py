@@ -98,7 +98,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 
 def get_main_keyboard():
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, persistent=True)
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton("🏠 Главное меню"))
     markup.row(KeyboardButton("🚛 Новый перевозчик"), KeyboardButton("📋 Новый договор"))
     markup.row(KeyboardButton("📦 Новая заявка"), KeyboardButton("📄 Мои заявки"))
