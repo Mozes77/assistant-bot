@@ -98,24 +98,12 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 
 def get_main_keyboard():
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, persistent=True)
     markup.row(KeyboardButton("🏠 Главное меню"))
-    markup.row(
-        KeyboardButton("🚛 Новый перевозчик"),
-        KeyboardButton("📋 Новый договор")
-    )
-    markup.row(
-        KeyboardButton("📦 Новая заявка"),
-        KeyboardButton("📄 Мои заявки")
-    )
-    markup.row(
-        KeyboardButton("🚗 Добавить машину"),
-        KeyboardButton("👤 Добавить водителя")
-    )
-    markup.row(
-        KeyboardButton("👥 Перевозчики"),
-        KeyboardButton("❓ Помощь")
-    )
+    markup.row(KeyboardButton("🚛 Новый перевозчик"), KeyboardButton("📋 Новый договор"))
+    markup.row(KeyboardButton("📦 Новая заявка"), KeyboardButton("📄 Мои заявки"))
+    markup.row(KeyboardButton("🚗 Добавить машину"), KeyboardButton("👤 Добавить водителя"))
+    markup.row(KeyboardButton("👥 Перевозчики"), KeyboardButton("❓ Помощь"))
     return markup
 
 
@@ -3133,20 +3121,74 @@ def process_scan_photo(chat_id: int, file_id: str):
 
 
 @bot.message_handler(commands=["start"])
-def handle_start_command(message):
-    chat_id = message.chat.id
-    clear_session(chat_id)
-
-    welcome_text = (
-        "Привет! Я бот для работы с перевозчиками.\n\n"
-        "Команды:\n"
-        "/menu — главное меню\n"
-        "/сканировать — распознать карточку\n"
-        "/помощь — справка"
+def handle_start(message):
+    bot.send_message(
+        message.chat.id,
+        "Бот запущен. Выберите действие:",
+        reply_markup=get_main_keyboard()
     )
 
-    bot.send_message(chat_id, welcome_text, reply_markup=get_main_keyboard())
-    show_main_menu(chat_id)
+
+@bot.message_handler(func=lambda m: m.text == "🏠 Главное меню")
+def handle_btn_main_menu(message):
+    clear_session(message.chat.id)
+    bot.send_message(message.chat.id, "🏠 Главное меню", reply_markup=get_main_keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text == "🚛 Новый перевозчик")
+def handle_btn_new_carrier(message):
+    show_carrier_add_options(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 Новый договор")
+def handle_btn_new_contract(message):
+    cmd_make_contract(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "📦 Новая заявка")
+def handle_btn_new_request(message):
+    bot.send_message(message.chat.id, "📦 Опишите заявку текстом — маршрут, количество палет, температурный режим.")
+
+
+@bot.message_handler(func=lambda m: m.text == "📄 Мои заявки")
+def handle_btn_my_requests(message):
+    bot.send_message(message.chat.id, "📄 Функция просмотра заявок в разработке. Скоро будет доступна!")
+
+
+@bot.message_handler(func=lambda m: m.text == "🚗 Добавить машину")
+def handle_btn_add_vehicle(message):
+    start_add_vehicle_flow(message.chat.id)
+
+
+@bot.message_handler(func=lambda m: m.text == "👤 Добавить водителя")
+def handle_btn_add_driver(message):
+    bot.send_message(message.chat.id, "👤 Функция добавления водителя в разработке.")
+
+
+@bot.message_handler(func=lambda m: m.text == "👥 Перевозчики")
+def handle_btn_carriers(message):
+    carriers = get_carriers_list()
+    if not carriers:
+        bot.send_message(message.chat.id, "❌ Перевозчиков пока нет в базе.")
+        return
+    lines = ["📋 Перевозчики в базе:\n"]
+    for c in carriers:
+        lines.append(f"• {c.get('name','—')} | ИНН: {c.get('inn','—')}")
+    bot.send_message(message.chat.id, "\n".join(lines))
+
+
+@bot.message_handler(func=lambda m: m.text == "❓ Помощь")
+def handle_btn_help(message):
+    bot.send_message(message.chat.id,
+        "❓ Помощь:\n\n"
+        "🚛 Новый перевозчик — добавить перевозчика в базу\n"
+        "📋 Новый договор — создать договор перевозки\n"
+        "📦 Новая заявка — создать заявку на рейс\n"
+        "🚗 Добавить машину — добавить ТС к перевозчику\n"
+        "👤 Добавить водителя — добавить водителя\n"
+        "👥 Перевозчики — список всех перевозчиков\n\n"
+        "По вопросам: @ваш_контакт"
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_forms")
