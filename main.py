@@ -297,18 +297,21 @@ TAX_MODE_HINTS = (
     "• Самозанятый — НПД"
 )
 
-VEHICLE_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSc32gLJghdZmLkNivNmUNHsUrXLjr2OBGqWiwkohleE-GAVTg/viewform"
+# Google Forms URLs
+VEHICLE_FORM_URL = "https://docs.google.com/forms/d/1KA-GQGbBGDZCut3y5uvetDRSzn70Gq8M5GlQjo_N7PE/viewform"
+CARRIER_FORM_URL = "https://docs.google.com/forms/d/1mJtwAxqExuHHQD96Z9ViXC8MDx5AfkZMa8RJnq2oOFs/viewform"
+TRAILER_FORM_URL = "https://docs.google.com/forms/d/199sIbgR6q8TmWHWQ2anS3m2F8QpPrEMaOiZLMjn1f0A/viewform"
+DRIVER_FORM_URL = "https://docs.google.com/forms/d/1xTxGCcwgplSXMikhb8FL1mZ_f04dNqoRLE96_8KMGd4/viewform"
+CUSTOMER_FORM_URL = "https://docs.google.com/forms/d/1CG9AnZTMN31CqnDekSclmJziEYgUnQ3a9XMoxVXMgKM/viewform"
+
+# Vehicle Form Entry IDs
 VEHICLE_FORM_ENTRIES = {
-    "carrier": "entry.1043783283",
-    "brand": "entry.2119031393",
-    "model": "entry.1151962997",
-    "plate": "entry.307360506",
-    "vin": "entry.1645886453",
-    "year": "entry.339978841",
-    "capacity": "entry.2054625960",
-    "pallets": "entry.403404622",
-    "temp": "entry.1170268362",
-    "category": "entry.154994274",
+    "carrier": "entry.210466749",
+    "brand": "entry.1498851787",
+    "model": "entry.1498851787",  # Используем то же поле что и brand (Марка и модель)
+    "plate": "entry.587597031",
+    "vin": "entry.1187966497",
+    "year": "entry.2051882103",
 }
 
 # =========================
