@@ -3836,6 +3836,7 @@ def handle_vehicle_carrier_select(call):
 
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("📸 Загрузить СТС", callback_data="upload_sts"))
+    markup.add(InlineKeyboardButton("✏️ Ввести данные текстом", callback_data="text_vehicle_input"))
     markup.add(InlineKeyboardButton("📝 Заполнить форму вручную", callback_data="manual_vehicle_form"))
 
     carrier_name = get_carrier_name_by_id(carrier_id) or f"ID {carrier_id}"
@@ -3871,6 +3872,23 @@ def handle_upload_sts_button(call):
         "✅ Марка и модель\n"
         "✅ VIN\n"
         "✅ Год выпуска",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "text_vehicle_input")
+def handle_text_vehicle_input(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    session["state"] = "waiting_sts_photo"
+    save_session(chat_id, session)
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id,
+        "✏️ Введите данные машины текстом в любом формате.\n\n"
+        "Например:\n"
+        "Госномер: К 494 НС 138\n"
+        "Марка: Мерседес\n"
+        "Прицеп: ОА 9708 24"
     )
 
 
