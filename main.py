@@ -2003,20 +2003,16 @@ def parse_passport(photo_base64: str) -> dict:
 
 
 def generate_vehicle_prefill_url(chat_id: int) -> str:
-    """Сформировать prefill URL для формы добавления машины."""
     session = get_session(chat_id)
     vehicle_data = session.get("vehicle_data", {}) or {}
     carrier_id = session.get("vehicle_carrier_id")
-
-    carrier_name = get_carrier_name_by_id(carrier_id)
+    carrier_name = get_carrier_name_by_id(carrier_id) if carrier_id else ""
     if not carrier_name:
         carrier_name = session.get("selected_carrier_name", "")
 
     params: Dict[str, str] = {}
-
     if carrier_name:
         params[VEHICLE_FORM_ENTRIES["carrier"]] = carrier_name
-
     if vehicle_data.get("brand"):
         params[VEHICLE_FORM_ENTRIES["brand"]] = str(vehicle_data["brand"])
     if vehicle_data.get("model"):
@@ -2028,12 +2024,11 @@ def generate_vehicle_prefill_url(chat_id: int) -> str:
     if vehicle_data.get("year"):
         params[VEHICLE_FORM_ENTRIES["year"]] = str(vehicle_data["year"])
 
-    prefill_url = VEHICLE_FORM_URL
+    logger.info("generate_vehicle_prefill_url: chat_id=%s carrier=%s vehicle=%s", chat_id, carrier_name, vehicle_data)
+    
     if params:
-        prefill_url = VEHICLE_FORM_URL + "?" + urlencode(params, quote_via=quote)
-
-    logger.info("generate_vehicle_prefill_url: chat_id=%s carrier_id=%s url=%s", chat_id, carrier_id, prefill_url)
-    return prefill_url
+        return VEHICLE_FORM_URL + "?" + urlencode(params, quote_via=quote)
+    return VEHICLE_FORM_URL
 
 
 def start_add_vehicle_flow(chat_id: int):
