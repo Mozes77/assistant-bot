@@ -1935,25 +1935,55 @@ def parse_driver_license(photo_base64: str) -> dict:
 
 
 def extract_driver_from_text(text):
-    """Извлекает данные водителя из текста"""
+    """Извлекает данные водителя из текста в свободной форме"""
     result = {}
 
-    fio_match = re.search(r'(?:ФИО|фио|Фамилия)[\s:]*([А-ЯЁа-яё\s]+)', text, re.IGNORECASE)
-    if fio_match:
-        result['full_name'] = fio_match.group(1).strip()
+    # ФИО - ищем 2-3 слова на кириллице подряд (фамилия имя отчество)
+    fio_patterns = [
+        r'(?:ФИО|фио|Фамилия)[\s:]*([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?)',
+        r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)',  # Три слова с заглавной
+    ]
+    for pattern in fio_patterns:
+        fio_match = re.search(pattern, text)
+        if fio_match:
+            result['full_name'] = fio_match.group(1).strip()
+            break
 
-    passport_match = re.search(r'(?:Паспорт|паспорт)[\s:]*(\d{4})\s*(\d{6})', text)
-    if passport_match:
-        result['passport_series'] = passport_match.group(1)
-        result['passport_number'] = passport_match.group(2)
+    # Паспорт - серия (4 цифры) и номер (6 цифр)
+    passport_patterns = [
+        r'(?:Паспорт|паспорт|серия|номер)[\s:]*(\d{4})[\s\-]*(\d{6})',
+        r'(\d{4})[\s\-]+(\d{6})',  # Просто 4 и 6 цифр подряд
+    ]
+    for pattern in passport_patterns:
+        passport_match = re.search(pattern, text)
+        if passport_match:
+            result['passport_series'] = passport_match.group(1)
+            result['passport_number'] = passport_match.group(2)
+            break
 
-    license_match = re.search(r'(?:ВУ|ву|Водительское)[\s:]*(\d{2}\s*\d{2}\s*\d{6})', text)
-    if license_match:
-        result['license_number'] = license_match.group(1).replace(' ', '')
+    # ВУ - разные форматы
+    license_patterns = [
+        r'(?:ВУ|ву|Водительское|удостоверение)[\s:]*(\d{2}[\s\-]*\d{2}[\s\-]*\d{6})',
+        r'(?:ВУ|ву)[\s:]*(\d{10})',
+        r'(?:^|\s)(\d{2}\s*\d{2}\s*\d{6})(?:\s|$)',  # В начале/конце строки
+    ]
+    for pattern in license_patterns:
+        license_match = re.search(pattern, text, re.MULTILINE)
+        if license_match:
+            result['license_number'] = license_match.group(1).replace(' ', '').replace('-', '')
+            break
 
-    phone_match = re.search(r'(?:Телефон|телефон|тел)[\s:]*([+\d\s\-()]+)', text)
-    if phone_match:
-        result['phone'] = phone_match.group(1).strip()
+    # Телефон
+    phone_patterns = [
+        r'(?:Телефон|телефон|тел|моб)[\s:]*([+\d][\d\s\-()]+)',
+        r'(\+7[\d\s\-()]{10,})',
+        r'(8[\d\s\-()]{10,})',
+    ]
+    for pattern in phone_patterns:
+        phone_match = re.search(pattern, text)
+        if phone_match:
+            result['phone'] = phone_match.group(1).strip()
+            break
 
     return result
 
@@ -4716,6 +4746,17 @@ def handle_photo(message):
                 )
                 return
 
+            if not extracted.get("full_name") or extracted.get("full_name") == "—":
+                bot.send_message(
+                    chat_id,
+                    "❌ Не удалось распознать ФИО водителя.\n\n"
+                    "Пожалуйста, отправьте более четкое фото или введите данные вручную в формате:\n"
+                    "ФИО: Иванов Иван Иванович\n"
+                    "Паспорт: 1234 567890\n"
+                    "ВУ: 12 34 567890"
+                )
+                return
+
             session["driver_data"] = extracted
             session["state"] = "waiting_driver_phone"
             session["driver_add_mode"] = "quick"
@@ -5255,6 +5296,18 @@ def handle_text(message):
         if state == "waiting_driver_photo":
             extracted = extract_driver_from_text(user_text)
 
+            if not extracted.get("full_name") or extracted.get("full_name") == "—":
+                bot.send_message(
+                    chat_id,
+                    "❌ Не удалось распознать ФИО водителя.\n\n"
+                    "Попробуйте ввести данные в формате:\n"
+                    "ФИО: Иванов Иван Иванович\n"
+                    "Паспорт: 1234 567890\n"
+                    "ВУ: 12 34 567890",
+                    reply_markup=get_main_keyboard()
+                )
+                return
+
             session["driver_data"] = extracted
             session["state"] = "waiting_driver_phone"
             session["driver_add_mode"] = "quick"
@@ -5273,6 +5326,18 @@ def handle_text(message):
 
         if state == "waiting_driver_text":
             extracted = extract_driver_from_text(user_text)
+
+            if not extracted.get("full_name") or extracted.get("full_name") == "—":
+                bot.send_message(
+                    chat_id,
+                    "❌ Не удалось распознать ФИО водителя.\n\n"
+                    "Попробуйте ввести данные в формате:\n"
+                    "ФИО: Иванов Иван Иванович\n"
+                    "Паспорт: 1234 567890\n"
+                    "ВУ: 12 34 567890",
+                    reply_markup=get_main_keyboard()
+                )
+                return
 
             session["driver_data"] = extracted
             session["state"] = "waiting_driver_phone"
@@ -5298,13 +5363,32 @@ def handle_text(message):
             save_session(chat_id, session)
 
             dd = driver_data
+
+            # ВАЛИДАЦИЯ: проверяем обязательные поля
+            if not dd.get('full_name') or dd.get('full_name') == '—':
+                bot.send_message(
+                    chat_id,
+                    "❌ Не удалось распознать ФИО водителя.\n\n"
+                    "Попробуйте ввести данные в формате:\n"
+                    "ФИО: Иванов Иван Иванович\n"
+                    "Паспорт: 1234 567890\n"
+                    "ВУ: 12 34 567890",
+                    reply_markup=get_main_keyboard()
+                )
+                return
+
             summary = (
                 f"✅ Водитель готов к сохранению:\n\n"
-                f"👤 ФИО: {dd.get('full_name', '—') or '—'}\n"
-                f"📋 Паспорт: {dd.get('passport_series', '')} {dd.get('passport_number', '')}\n"
-                f"🚗 ВУ: {dd.get('license_number', '—') or '—'}\n"
-                f"📞 Телефон: {dd.get('phone', '—')}\n"
+                f"👤 ФИО: {dd.get('full_name', '—')}\n"
             )
+
+            if dd.get('passport_series') and dd.get('passport_number'):
+                summary += f"📋 Паспорт: {dd.get('passport_series')} {dd.get('passport_number')}\n"
+
+            if dd.get('license_number'):
+                summary += f"🚗 ВУ: {dd.get('license_number')}\n"
+
+            summary += f"📞 Телефон: {dd.get('phone', '—')}\n"
 
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("💾 Сохранить водителя", callback_data="save_driver"))
