@@ -1875,17 +1875,26 @@ def parse_driver_license(photo_base64: str) -> dict:
         return {}
 
     prompt_text = (
-        "Распознай водительское удостоверение РФ.\n\n"
-        "Верни JSON:\n"
+        "Извлеки данные из документа водителя (паспорт РФ или водительское удостоверение):\n"
+        "- ФИО (полностью)\n"
+        "- Серия и номер паспорта (если это паспорт)\n"
+        "- Номер водительского удостоверения (если это ВУ)\n"
+        "- Дата рождения\n"
+        "- Дата выдачи документа\n"
+        "- Срок действия (для ВУ)\n"
+        "- Категории (для ВУ)\n\n"
+        "Верни строго JSON без markdown:\n"
         "{\n"
         '  "full_name": "Фамилия Имя Отчество",\n'
         '  "birth_date": "ДД.ММ.ГГГГ",\n'
+        '  "passport_series": "25 08",\n'
+        '  "passport_number": "123456",\n'
         '  "license_number": "12 34 567890",\n'
         '  "categories": "B,C,CE",\n'
         '  "issue_date": "ДД.ММ.ГГГГ",\n'
         '  "expiry_date": "ДД.ММ.ГГГГ"\n'
         "}\n\n"
-        "Если что-то не видно — пустая строка."
+        "Если поле не найдено — верни пустую строку."
     )
 
     payload = {
@@ -4709,11 +4718,7 @@ def handle_photo(message):
         session = get_session(chat_id)
         state = session.get("state", "")
 
-        # Режим сканирования карточки
-        if session.get("scan_mode") or state == "scan_waiting_photo":
-            process_scan_photo(chat_id, file_id)
-            return
-
+        # ВАЖНО: сначала обрабатываем фото по активному состоянию сессии.
         if state == "waiting_driver_photo":
             bot.send_message(chat_id, "🔍 Распознаю данные водителя...")
             image_bytes, download_error = download_telegram_file(file_id)
@@ -4945,6 +4950,11 @@ def handle_photo(message):
 
             # Дозапросить недостающие поля
             ask_missing_driver_fields(chat_id)
+            return
+
+        # Режим сканирования карточки — только если нет более приоритетного state-сценария.
+        if session.get("scan_mode") or state == "scan_waiting_photo":
+            process_scan_photo(chat_id, file_id)
             return
 
         bot.send_message(chat_id, "Получил фото. Считываю реквизиты с карточки...")
