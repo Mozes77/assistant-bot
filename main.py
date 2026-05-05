@@ -1874,28 +1874,44 @@ def parse_driver_license(photo_base64: str) -> dict:
         logger.warning("parse_driver_license: OPENAI_API_KEY не задан")
         return {}
 
-    prompt_text = (
-        "Извлеки данные из документа водителя (паспорт РФ или водительское удостоверение):\n"
-        "- ФИО (полностью)\n"
-        "- Серия и номер паспорта (если это паспорт)\n"
-        "- Номер водительского удостоверения (если это ВУ)\n"
-        "- Дата рождения\n"
-        "- Дата выдачи документа\n"
-        "- Срок действия (для ВУ)\n"
-        "- Категории (для ВУ)\n\n"
-        "Верни строго JSON без markdown:\n"
-        "{\n"
-        '  "full_name": "Фамилия Имя Отчество",\n'
-        '  "birth_date": "ДД.ММ.ГГГГ",\n'
-        '  "passport_series": "25 08",\n'
-        '  "passport_number": "123456",\n'
-        '  "license_number": "12 34 567890",\n'
-        '  "categories": "B,C,CE",\n'
-        '  "issue_date": "ДД.ММ.ГГГГ",\n'
-        '  "expiry_date": "ДД.ММ.ГГГГ"\n'
-        "}\n\n"
-        "Если поле не найдено — верни пустую строку."
-    )
+    prompt_text = """Извлеки ВСЕ доступные данные о водителе из этого изображения.
+Это может быть:
+- Водительское удостоверение РФ
+- Паспорт РФ
+- Карточка водителя
+- Любой документ с данными водителя
+
+Извлеки ВСЕ найденные данные:
+- ФИО (полностью, фамилия имя отчество)
+- Серия и номер паспорта (формат: ХХХХ ХХХХХХ)
+- Номер водительского удостоверения (формат: ХХ ХХ ХХХХХХ, может быть подписан как "ВУ", "В.у.", "Водительское удостоверение")
+- Дата выдачи ВУ
+- Срок действия ВУ
+- Дата рождения
+- Место рождения
+- Телефон(ы) - ЛЮБЫЕ номера телефонов на изображении в любом формате
+- ИНН (если есть)
+
+ВАЖНО:
+- Извлекай ВСЕ телефонные номера которые видишь
+- Номер ВУ может быть записан как "В.у.:", "ВУ:", "Водительское удостоверение №"
+- Если данных нет - оставь поле пустым
+
+Верни ТОЛЬКО валидный JSON без markdown разметки:
+{
+  "full_name": "",
+  "passport_series": "",
+  "passport_number": "",
+  "license_number": "",
+  "license_date": "",
+  "license_expiry": "",
+  "birth_date": "",
+  "birth_place": "",
+  "phone": "",
+  "phone2": "",
+  "inn": "",
+  "categories": ""
+}"""
 
     payload = {
         "model": OPENAI_CARD_MODEL,
@@ -1933,11 +1949,32 @@ def parse_driver_license(photo_base64: str) -> dict:
             return {}
 
         output_text = extract_output_text(data)
-        parsed, parse_error = safe_json_loads(output_text)
+        cleaned_text = output_text.replace("```json", "").replace("```", "").strip()
+
+        parsed, parse_error = safe_json_loads(cleaned_text)
         if parse_error:
-            logger.error("parse_driver_license: ошибка парсинга JSON: %s", parse_error)
+            logger.error("parse_driver_license: ошибка парсинга JSON: %s | raw=%s", parse_error, output_text)
             return {}
-        return parsed if parsed else {}
+
+        parsed = parsed if isinstance(parsed, dict) else {}
+
+        # Поддержка нескольких названий полей из OCR
+        if not parsed.get("issue_date") and parsed.get("license_date"):
+            parsed["issue_date"] = parsed.get("license_date", "")
+        if not parsed.get("expiry_date") and parsed.get("license_expiry"):
+            parsed["expiry_date"] = parsed.get("license_expiry", "")
+
+        # Склеиваем найденные телефоны в одно поле phone
+        phones = []
+        for key in ("phone", "phone2"):
+            value = str(parsed.get(key, "") or "").strip()
+            if value and value not in phones:
+                phones.append(value)
+
+        if phones:
+            parsed["phone"] = ", ".join(phones)
+
+        return parsed
     except Exception as e:
         logger.exception("Ошибка парсинга ВУ: %s", e)
         return {}
@@ -4763,19 +4800,33 @@ def handle_photo(message):
                 return
 
             session["driver_data"] = extracted
-            session["state"] = "waiting_driver_phone"
             session["driver_add_mode"] = "quick"
-            save_session(chat_id, session)
 
             dd = extracted
             summary = (
                 f"✅ Данные распознаны:\n\n"
                 f"👤 ФИО: {dd.get('full_name', '—') or '—'}\n"
-                f"📋 Паспорт: {dd.get('passport_series', '')} {dd.get('passport_number', '')}\n"
-                f"🚗 ВУ: {dd.get('license_number', '—') or '—'}\n\n"
-                f"📞 Укажите номер телефона водителя:"
             )
-            bot.send_message(chat_id, summary)
+
+            if dd.get('passport_series') and dd.get('passport_number'):
+                summary += f"📋 Паспорт: {dd['passport_series']} {dd['passport_number']}\n"
+
+            if dd.get('license_number'):
+                summary += f"🚗 ВУ: {dd['license_number']}\n"
+
+            if dd.get('phone'):
+                summary += f"📞 Телефон: {dd['phone']}\n"
+                session["state"] = ""
+                save_session(chat_id, session)
+
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("💾 Сохранить водителя", callback_data="save_driver"))
+                bot.send_message(chat_id, summary, reply_markup=markup)
+            else:
+                summary += "\n📞 Укажите номер телефона водителя:"
+                session["state"] = "waiting_driver_phone"
+                save_session(chat_id, session)
+                bot.send_message(chat_id, summary)
             return
 
         # Сценарий добавления машины через СТС
