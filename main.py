@@ -1934,6 +1934,30 @@ def parse_driver_license(photo_base64: str) -> dict:
         return {}
 
 
+def extract_driver_from_text(text):
+    """Извлекает данные водителя из текста"""
+    result = {}
+
+    fio_match = re.search(r'(?:ФИО|фио|Фамилия)[\s:]*([А-ЯЁа-яё\s]+)', text, re.IGNORECASE)
+    if fio_match:
+        result['full_name'] = fio_match.group(1).strip()
+
+    passport_match = re.search(r'(?:Паспорт|паспорт)[\s:]*(\d{4})\s*(\d{6})', text)
+    if passport_match:
+        result['passport_series'] = passport_match.group(1)
+        result['passport_number'] = passport_match.group(2)
+
+    license_match = re.search(r'(?:ВУ|ву|Водительское)[\s:]*(\d{2}\s*\d{2}\s*\d{6})', text)
+    if license_match:
+        result['license_number'] = license_match.group(1).replace(' ', '')
+
+    phone_match = re.search(r'(?:Телефон|телефон|тел)[\s:]*([+\d\s\-()]+)', text)
+    if phone_match:
+        result['phone'] = phone_match.group(1).strip()
+
+    return result
+
+
 def parse_passport(photo_base64: str) -> dict:
     """
     Парсинг паспорта РФ через OpenAI Vision.
@@ -3160,7 +3184,7 @@ def handle_btn_add_vehicle(message):
 
 @bot.message_handler(func=lambda m: m.text == "👤 Добавить водителя")
 def handle_btn_add_driver(message):
-    bot.send_message(message.chat.id, "👤 Функция добавления водителя в разработке.")
+    start_add_driver(message)
 
 
 @bot.message_handler(func=lambda m: m.text == "👥 Перевозчики")
@@ -4252,11 +4276,20 @@ def handle_driver_scan_passport(call):
 def handle_driver_manual_input(call):
     chat_id = call.message.chat.id
     session = get_session(chat_id)
-    session["state"] = "waiting_driver_full_name"
+    session["state"] = "waiting_driver_text"
+    session["driver_add_mode"] = "quick"
     save_session(chat_id, session)
 
     bot.answer_callback_query(call.id)
-    bot.send_message(chat_id, "✏️ Введите ФИО полностью (Фамилия Имя Отчество):")
+    bot.send_message(
+        chat_id,
+        "✏️ Введите данные водителя в свободной форме:\n\n"
+        "Например:\n"
+        "ФИО: Иванов Иван Иванович\n"
+        "Паспорт: 1234 567890\n"
+        "ВУ: 12 34 567890\n"
+        "Телефон: +7 900 123-45-67"
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "ask_passport_manual")
@@ -4651,6 +4684,54 @@ def handle_photo(message):
             process_scan_photo(chat_id, file_id)
             return
 
+        if state == "waiting_driver_photo":
+            bot.send_message(chat_id, "🔍 Распознаю данные водителя...")
+            image_bytes, download_error = download_telegram_file(file_id)
+            if download_error:
+                bot.send_message(chat_id, f"Ошибка загрузки: {download_error}")
+                return
+
+            photo_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
+            extracted = {}
+            license_data = parse_driver_license(photo_base64)
+            passport_data = parse_passport(photo_base64)
+
+            if isinstance(license_data, dict):
+                extracted.update({k: v for k, v in license_data.items() if v})
+            if isinstance(passport_data, dict):
+                if passport_data.get("full_name"):
+                    extracted["full_name"] = passport_data.get("full_name")
+                if passport_data.get("passport_series"):
+                    extracted["passport_series"] = passport_data.get("passport_series")
+                if passport_data.get("passport_number"):
+                    extracted["passport_number"] = passport_data.get("passport_number")
+                if passport_data.get("birth_date") and not extracted.get("birth_date"):
+                    extracted["birth_date"] = passport_data.get("birth_date")
+
+            if not extracted:
+                bot.send_message(
+                    chat_id,
+                    "❌ Не удалось распознать данные с фото. Отправьте более четкое фото или нажмите «✏️ Ввести данные текстом».",
+                )
+                return
+
+            session["driver_data"] = extracted
+            session["state"] = "waiting_driver_phone"
+            session["driver_add_mode"] = "quick"
+            save_session(chat_id, session)
+
+            dd = extracted
+            summary = (
+                f"✅ Данные распознаны:\n\n"
+                f"👤 ФИО: {dd.get('full_name', '—') or '—'}\n"
+                f"📋 Паспорт: {dd.get('passport_series', '')} {dd.get('passport_number', '')}\n"
+                f"🚗 ВУ: {dd.get('license_number', '—') or '—'}\n\n"
+                f"📞 Укажите номер телефона водителя:"
+            )
+            bot.send_message(chat_id, summary)
+            return
+
         # Сценарий добавления машины через СТС
         if state == "waiting_sts_photo":
             bot.send_message(chat_id, "🔍 Распознаю СТС...")
@@ -5022,7 +5103,7 @@ def handle_btn_new_contract(message):
 
 @bot.message_handler(func=lambda m: m.text == "👤 Добавить водителя")
 def handle_btn_add_driver(message):
-    start_add_driver_flow(message.chat.id)
+    start_add_driver(message)
 
 
 @bot.message_handler(func=lambda m: m.text == "🏠 Главное меню")
@@ -5035,85 +5116,84 @@ def handle_btn_main_menu(message):
     )
 
 
-def start_add_driver_flow(chat_id: int):
-    """Начать процесс добавления водителя - показать список перевозчиков"""
+def start_add_driver(message):
+    chat_id = message.chat.id
     session = get_session(chat_id)
     session["state"] = "selecting_carrier_for_driver"
+    session["driver_add_mode"] = "quick"
     save_session(chat_id, session)
 
-    url = os.getenv("GOOGLE_SCRIPT_URL")
     payload = {"action": "list_carriers"}
+    data, error = call_google_script(payload)
+    if error:
+        bot.send_message(chat_id, f"❌ Ошибка: {error}")
+        return
 
-    try:
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-        data, _ = safe_json_loads(response.text)
-        result = data.get("result", data)
+    if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), dict):
+        data = data.get("result", {})
 
-        if not result.get("success"):
-            bot.send_message(chat_id, "❌ Не удалось получить список перевозчиков", reply_markup=get_main_keyboard())
-            return
+    carriers = data.get("carriers", [])
+    if not carriers:
+        bot.send_message(chat_id, "❌ Нет перевозчиков. Сначала добавьте перевозчика.")
+        return
 
-        carriers = result.get("carriers", [])
+    markup = InlineKeyboardMarkup()
+    for c in carriers:
+        carrier_id = c.get("id", "")
+        name = c.get("name", "Без названия")
+        markup.add(InlineKeyboardButton(name, callback_data=f"add_driver_carrier_{carrier_id}"))
 
-        if not carriers:
-            bot.send_message(
-                chat_id,
-                "📋 У вас пока нет перевозчиков.\n\nСначала добавьте перевозчика через 🚛 Новый перевозчик",
-                reply_markup=get_main_keyboard()
-            )
-            return
-
-        markup = InlineKeyboardMarkup(row_width=1)
-        for carrier in carriers:
-            carrier_id = carrier.get("id", "")
-            name = carrier.get("name", "")
-            inn = carrier.get("inn", "")
-            text = f"{name} (ИНН: {inn})"
-            markup.add(InlineKeyboardButton(text, callback_data=f"select_carrier_for_driver_{carrier_id}"))
-
-        bot.send_message(
-            chat_id,
-            "👤 Выберите перевозчика для добавления водителя:",
-            reply_markup=markup
-        )
-
-    except Exception as e:
-        logger.exception("Ошибка получения списка перевозчиков: %s", e)
-        bot.send_message(chat_id, f"❌ Ошибка: {e}", reply_markup=get_main_keyboard())
+    bot.send_message(chat_id, "👤 Выберите перевозчика:", reply_markup=markup)
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("select_carrier_for_driver_"))
-def handle_select_carrier_for_driver(call):
-    """Обработка выбора перевозчика для водителя"""
+@bot.callback_query_handler(func=lambda call: call.data.startswith("add_driver_carrier_"))
+def handle_add_driver_carrier(call):
     chat_id = call.message.chat.id
-    carrier_id = call.data.replace("select_carrier_for_driver_", "")
+    carrier_id = call.data.replace("add_driver_carrier_", "")
 
     session = get_session(chat_id)
     session["driver_carrier_id"] = carrier_id
+    session["state"] = "waiting_driver_photo"
     session["driver_data"] = {}
-    session["state"] = "waiting_driver_method"
+    session["driver_add_mode"] = "quick"
     save_session(chat_id, session)
 
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineKeyboardButton("📸 Сканировать ВУ", callback_data="driver_scan_license"),
-        InlineKeyboardButton("📄 Сканировать паспорт", callback_data="driver_scan_passport"),
-        InlineKeyboardButton("✏️ Ввести вручную", callback_data="driver_manual_input")
+    bot.answer_callback_query(call.id)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✏️ Ввести данные текстом", callback_data="driver_manual_input"))
+
+    bot.send_message(
+        chat_id,
+        "📸 Отправьте фото водительского удостоверения или паспорта для распознавания.\n\n"
+        "Или нажмите кнопку ниже для ввода данных вручную.",
+        reply_markup=markup,
     )
 
+
+@bot.callback_query_handler(func=lambda call: call.data == "save_driver")
+def handle_save_driver(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    driver_data = session.get("driver_data", {})
+    carrier_id = session.get("driver_carrier_id", "")
+
+    payload = {
+        "action": "save_driver",
+        "carrier_id": carrier_id,
+        "driver_data": driver_data,
+    }
+
+    data, error = call_google_script(payload)
+    if error:
+        bot.send_message(chat_id, f"❌ Ошибка: {error}")
+        return
+
     bot.answer_callback_query(call.id)
-    bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=call.message.message_id,
-        text=(
-            "Как добавить водителя?\n\n"
-            "📸 Сканировать ВУ — распознаю ФИО, дату рождения, номер ВУ, категории, сроки\n"
-            "📄 Сканировать паспорт — распознаю паспортные данные, адрес\n"
-            "✏️ Ввести вручную — запрошу все поля по очереди"
-        ),
-        reply_markup=markup
-    )
+    session["state"] = ""
+    session["driver_add_mode"] = ""
+    save_session(chat_id, session)
+    bot.send_message(chat_id, "✅ Водитель сохранен!", reply_markup=get_main_keyboard())
 
 
 @bot.message_handler(func=lambda message: True, content_types=['text'])
@@ -5151,8 +5231,7 @@ def handle_text(message):
         return
 
     if text == "👤 Добавить водителя":
-        # TODO: реализовать добавление водителя отдельно
-        bot.send_message(chat_id, "Эта функция доступна после добавления перевозчика", reply_markup=get_main_menu_keyboard())
+        start_add_driver(message)
         return
 
     if text == "👥 Перевозчики":
@@ -5172,6 +5251,65 @@ def handle_text(message):
     try:
         session = get_session(chat_id)
         state = session.get("state", "")
+
+        if state == "waiting_driver_photo":
+            extracted = extract_driver_from_text(user_text)
+
+            session["driver_data"] = extracted
+            session["state"] = "waiting_driver_phone"
+            session["driver_add_mode"] = "quick"
+            save_session(chat_id, session)
+
+            dd = extracted
+            summary = (
+                f"✅ Данные распознаны:\n\n"
+                f"👤 ФИО: {dd.get('full_name', '—') or '—'}\n"
+                f"📋 Паспорт: {dd.get('passport_series', '')} {dd.get('passport_number', '')}\n"
+                f"🚗 ВУ: {dd.get('license_number', '—') or '—'}\n\n"
+                f"📞 Укажите номер телефона водителя:"
+            )
+            bot.send_message(chat_id, summary)
+            return
+
+        if state == "waiting_driver_text":
+            extracted = extract_driver_from_text(user_text)
+
+            session["driver_data"] = extracted
+            session["state"] = "waiting_driver_phone"
+            session["driver_add_mode"] = "quick"
+            save_session(chat_id, session)
+
+            dd = extracted
+            summary = (
+                f"✅ Данные получены:\n\n"
+                f"👤 ФИО: {dd.get('full_name', '—') or '—'}\n"
+                f"📋 Паспорт: {dd.get('passport_series', '')} {dd.get('passport_number', '')}\n"
+                f"🚗 ВУ: {dd.get('license_number', '—') or '—'}\n\n"
+                f"📞 Укажите номер телефона водителя:"
+            )
+            bot.send_message(chat_id, summary)
+            return
+
+        if state == "waiting_driver_phone" and session.get("driver_add_mode") == "quick":
+            driver_data = session.get("driver_data", {})
+            driver_data["phone"] = user_text.strip()
+            session["driver_data"] = driver_data
+            session["state"] = ""
+            save_session(chat_id, session)
+
+            dd = driver_data
+            summary = (
+                f"✅ Водитель готов к сохранению:\n\n"
+                f"👤 ФИО: {dd.get('full_name', '—') or '—'}\n"
+                f"📋 Паспорт: {dd.get('passport_series', '')} {dd.get('passport_number', '')}\n"
+                f"🚗 ВУ: {dd.get('license_number', '—') or '—'}\n"
+                f"📞 Телефон: {dd.get('phone', '—')}\n"
+            )
+
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("💾 Сохранить водителя", callback_data="save_driver"))
+            bot.send_message(chat_id, summary, reply_markup=markup)
+            return
 
         if state == "waiting_sts_photo" and user_text:
             bot.send_message(chat_id, "🔍 Распознаю данные машины из текста...")
