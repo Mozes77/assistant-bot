@@ -3914,6 +3914,25 @@ def handle_manual_vehicle_form(call):
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "save_vehicle")
+def handle_save_vehicle(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    vehicle_data = session.get("vehicle_data", {})
+    carrier_id = session.get("vehicle_carrier_id", "")
+    payload = {
+        "action": "save_vehicle",
+        "carrier_id": carrier_id,
+        "vehicle_data": vehicle_data
+    }
+    data, error = call_google_script(payload)
+    if error:
+        bot.send_message(chat_id, f"❌ Ошибка: {error}")
+        return
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "✅ Машина сохранена!", reply_markup=get_main_keyboard())
+
+
 @bot.callback_query_handler(func=lambda call: call.data == "vehicle_manual_entry")
 def handle_vehicle_manual_entry(call):
     chat_id = call.message.chat.id
@@ -5189,24 +5208,21 @@ def handle_text(message):
                 extracted, parse_error = safe_json_loads(output_text)
                 if not parse_error and extracted:
                     session["vehicle_data"] = extracted
-                    session["state"] = ""
+                    session["state"] = "waiting_vehicle_temp"
                     save_session(chat_id, session)
-                    
+
+                    vd = extracted
                     summary = (
                         f"✅ Данные распознаны:\n\n"
-                        f"🚗 Марка: {extracted.get('brand','—') or '—'}\n"
-                        f"📋 Модель: {extracted.get('model','—') or '—'}\n"
-                        f"🔢 Госномер: {extracted.get('plate','—') or '—'}\n"
-                        f"🔑 VIN: {extracted.get('vin','—') or '—'}\n"
-                        f"📅 Год: {extracted.get('year','—') or '—'}\n"
+                        f"🚗 Марка: {vd.get('brand','—') or '—'}\n"
+                        f"📋 Модель: {vd.get('model','—') or '—'}\n"
+                        f"🔢 Госномер: {vd.get('plate','—') or '—'}\n"
                     )
-                    if extracted.get('trailer_plate'):
-                        summary += f"🚛 Прицеп: {extracted.get('trailer_plate','—')}\n"
-                    
-                    prefill_url = generate_vehicle_prefill_url(chat_id)
-                    markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton("📝 Открыть форму", url=prefill_url))
-                    bot.send_message(chat_id, summary + "\nДополните остальные данные в форме:", reply_markup=markup)
+                    if vd.get('trailer_plate'):
+                        summary += f"🚛 Прицеп: {vd.get('trailer_plate')}\n"
+
+                    summary += "\n🌡 Укажите температурный режим:\nПример: -5/+12 или без температуры"
+                    bot.send_message(chat_id, summary)
                     return
     
             bot.send_message(chat_id, "❌ Не удалось распознать. Попробуйте фото СТС или заполните форму вручную.")
@@ -5340,7 +5356,7 @@ def handle_text(message):
             return
 
         # === Дозапрос параметров машины: палеты ===
-        if state == "waiting_vehicle_pallets":
+        if state == "waiting_vehicle_pallets" and session.get("vehicle_data", {}).get("capacity_tons") is not None:
             try:
                 pallets = int(user_text.strip())
                 session["vehicle_data"]["pallets"] = pallets
@@ -5352,7 +5368,7 @@ def handle_text(message):
             return
 
         # === Дозапрос параметров машины: температурный режим ===
-        if state == "waiting_vehicle_temp":
+        if state == "waiting_vehicle_temp" and session.get("vehicle_data", {}).get("capacity_tons") is not None:
             temp_regime = user_text.strip()
             session["vehicle_data"]["temp_regime"] = temp_regime
             session["state"] = ""
@@ -5360,6 +5376,39 @@ def handle_text(message):
 
             # Сохраняем машину в Google Sheets
             save_vehicle_to_sheets(chat_id)
+            return
+
+        if state == "waiting_vehicle_temp":
+            vehicle_data = session.get("vehicle_data", {})
+            vehicle_data["temp"] = user_text.strip()
+            session["vehicle_data"] = vehicle_data
+            session["state"] = "waiting_vehicle_pallets"
+            save_session(chat_id, session)
+            bot.send_message(chat_id, "📦 Вместимость (количество палет)?")
+            return
+
+        if state == "waiting_vehicle_pallets":
+            vehicle_data = session.get("vehicle_data", {})
+            vehicle_data["pallets"] = user_text.strip()
+            session["vehicle_data"] = vehicle_data
+            session["state"] = ""
+            save_session(chat_id, session)
+
+            vd = vehicle_data
+            summary = (
+                f"✅ Машина готова к сохранению:\n\n"
+                f"🚗 Марка: {vd.get('brand','—') or '—'}\n"
+                f"📋 Модель: {vd.get('model','—') or '—'}\n"
+                f"🔢 Госномер: {vd.get('plate','—') or '—'}\n"
+                f"🌡 Темп режим: {vd.get('temp','—')}\n"
+                f"📦 Палет: {vd.get('pallets','—')}\n"
+            )
+            if vd.get('trailer_plate'):
+                summary += f"🚛 Прицеп: {vd.get('trailer_plate')}\n"
+
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("💾 Сохранить машину", callback_data="save_vehicle"))
+            bot.send_message(chat_id, summary, reply_markup=markup)
             return
 
         # === Обработка ввода данных прицепа ===
