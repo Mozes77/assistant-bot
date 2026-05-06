@@ -2019,17 +2019,30 @@ def extract_driver_from_text(text):
             result['license_number'] = license_match.group(1).replace(' ', '').replace('-', '')
             break
 
-    # Телефон
+    # Телефон - извлекаем ДВА телефона если они есть
     phone_patterns = [
         r'(?:Телефон|телефон|тел|моб)[\s:]*([+\d][\d\s\-()]+)',
         r'(\+7[\d\s\-()]{10,})',
         r'(8[\d\s\-()]{10,})',
     ]
+    
+    # Сначала ищем все телефоны в тексте
+    all_phones = []
     for pattern in phone_patterns:
-        phone_match = re.search(pattern, text)
-        if phone_match:
-            result['phone'] = phone_match.group(1).strip()
-            break
+        phone_matches = re.finditer(pattern, text)
+        for match in phone_matches:
+            phone = match.group(1).strip()
+            # Разделяем по запятой если в одном совпадении несколько номеров
+            for part in re.split(r'[,;/]', phone):
+                part = part.strip()
+                if part and len(part) >= 10:  # Минимальная длина телефона
+                    all_phones.append(part)
+    
+    # Записываем первые два телефона
+    if len(all_phones) > 0:
+        result['phone'] = all_phones[0]
+    if len(all_phones) > 1:
+        result['phone2'] = all_phones[1]
 
     return result
 
@@ -5418,7 +5431,19 @@ def handle_text(message):
 
         if state == "waiting_driver_phone" and session.get("driver_add_mode") == "quick":
             driver_data = session.get("driver_data", {})
-            driver_data["phone"] = user_text.strip()
+            
+            # Разделяем телефоны если их несколько через запятую
+            phone_text = user_text.strip()
+            phones = [p.strip() for p in re.split(r'[,;/]', phone_text) if p.strip()]
+            
+            if len(phones) > 0:
+                driver_data["phone"] = phones[0]
+            if len(phones) > 1:
+                driver_data["phone2"] = phones[1]
+            elif len(phones) == 1:
+                # Если только один телефон, убедимся что phone2 не установлен
+                driver_data.pop("phone2", None)
+            
             session["driver_data"] = driver_data
             session["state"] = ""
             save_session(chat_id, session)
