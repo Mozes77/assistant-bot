@@ -2643,12 +2643,24 @@ def _trip_show_vehicles(chat_id: int, carrier_id: str):
 
 
 def _trip_show_drivers(chat_id: int, carrier_id: str):
+    print("GET DRIVERS carrier_id =", carrier_id)
+    logger.info("GET DRIVERS carrier_id=%s", carrier_id)
+
     data, error = call_google_script({"action": "get_carrier_drivers", "carrier_id": carrier_id})
     if error:
         bot.send_message(chat_id, f"❌ Не удалось получить водителей: {error}")
         return
 
-    result = _unwrap_google_result(data)
+    print("API response =", data)
+    logger.info("get_carrier_drivers raw response=%s", data)
+
+    # Ожидаемый формат: {"ok": true, "result": {"success": true, "drivers": [...]}}
+    result = data.get("result", {}) if isinstance(data, dict) else {}
+
+    # Fallback для обратной совместимости со старыми форматами
+    if not isinstance(result, dict):
+        result = _unwrap_google_result(data)
+
     if isinstance(result, dict) and result.get("success") is False:
         bot.send_message(chat_id, f"❌ Ошибка списка водителей: {result.get('error', 'неизвестная ошибка')}")
         return
@@ -2659,6 +2671,9 @@ def _trip_show_drivers(chat_id: int, carrier_id: str):
     elif isinstance(result, list):
         drivers = result
 
+    print("Drivers list =", drivers)
+    logger.info("get_carrier_drivers parsed drivers count=%s", len(drivers))
+
     session = get_session(chat_id)
     session["state"] = "trip_request_select_driver"
     session["trip_drivers_map"] = {}
@@ -2666,8 +2681,8 @@ def _trip_show_drivers(chat_id: int, carrier_id: str):
     markup = InlineKeyboardMarkup()
     for idx, driver in enumerate(drivers[:80]):
         driver_id = _extract_id(driver, ["id", "driver_id"])
-        name = str(driver.get("full_name") or driver.get("name") or "").strip() or f"Водитель {idx+1}"
-        phone = str(driver.get("phone") or "").strip()
+        name = str(driver.get("full_name") or driver.get("name") or driver.get("driver_name") or "").strip() or f"Водитель {idx+1}"
+        phone = str(driver.get("phone") or driver.get("driver_phone") or "").strip()
         if not driver_id:
             driver_id = f"driver_{idx}"
 
