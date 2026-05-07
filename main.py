@@ -3032,17 +3032,56 @@ def handle_trip_finalize(call):
     data = _trip_request_data(session)
     payload = _trip_build_create_payload(data)
 
-    gs_data, gs_error = call_google_script(payload)
+    required_fields = [
+        "action",
+        "customer_name",
+        "carrier_name",
+        "carrier_inn",
+        "loading_datetime",
+        "unloading_datetime",
+        "loading_address",
+        "unloading_address",
+        "loading_manager",
+        "loading_manager_phone",
+        "unloading_manager",
+        "unloading_manager_phone",
+        "route_name",
+        "cargo_description",
+        "weight",
+        "pallets",
+        "temperature_mode",
+        "vehicle_number",
+        "vehicle_model",
+        "trailer_number",
+        "driver_name",
+        "driver_phone",
+        "price",
+        "vat_type",
+        "payment_terms",
+        "additional_terms",
+    ]
+    missing_required = [
+        key for key in required_fields
+        if str(payload.get(key, "")).strip() == ""
+    ]
+
+    print("CREATE TRIP REQUEST PAYLOAD =", json.dumps(payload, indent=2, ensure_ascii=False))
+    if missing_required:
+        print("CREATE TRIP REQUEST PAYLOAD MISSING FIELDS =", json.dumps(missing_required, indent=2, ensure_ascii=False))
+
+    response, gs_error = call_google_script(payload)
     if gs_error:
         bot.send_message(chat_id, f"❌ Не удалось создать договор-заявку: {gs_error}")
         return
 
-    result = _unwrap_google_result(gs_data)
+    print("CREATE TRIP REQUEST RESPONSE =", json.dumps(response, indent=2, ensure_ascii=False))
+
+    result = _unwrap_google_result(response)
     if isinstance(result, dict) and result.get("success"):
         request_number = result.get("requestNumber") or result.get("request_number") or result.get("number") or "—"
         request_date = result.get("requestDate") or result.get("date") or "—"
-        doc_url = result.get("docUrl") or result.get("url") or ""
-        pdf_url = result.get("pdfUrl") or ""
+        doc_url = result.get("docUrl") or result.get("doc_url") or result.get("url") or ""
+        pdf_url = result.get("pdfUrl") or result.get("pdf_url") or ""
 
         msg = [
             "✅ Договор-заявка создана!",
@@ -3059,8 +3098,18 @@ def handle_trip_finalize(call):
         save_session(chat_id, session)
         return
 
-    err = result.get("error", "Неизвестная ошибка") if isinstance(result, dict) else "Неожиданный формат ответа"
-    bot.send_message(chat_id, f"❌ Не удалось создать договор-заявку: {err}")
+    error_text = (
+        (response.get("error") if isinstance(response, dict) else None)
+        or (result.get("error") if isinstance(result, dict) else None)
+        or (
+            (response.get("result", {}) or {}).get("error")
+            if isinstance(response, dict) and isinstance(response.get("result"), dict)
+            else None
+        )
+        or (response.get("message") if isinstance(response, dict) else None)
+        or str(response)
+    )
+    bot.send_message(chat_id, "❌ Не удалось создать договор-заявку:\n" + str(error_text))
 
 def handle_voice_command(message, text: str):
     text_lower = (text or "").lower()
