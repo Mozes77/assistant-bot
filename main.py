@@ -2339,6 +2339,7 @@ TRIP_REQUEST_STATE_KEYS = [
     "trip_carriers_map",
     "trip_vehicles_map",
     "trip_drivers_map",
+    "drivers",
 ]
 
 
@@ -2646,54 +2647,64 @@ def _trip_show_drivers(chat_id: int, carrier_id: str):
     print("GET DRIVERS carrier_id =", carrier_id)
     logger.info("GET DRIVERS carrier_id=%s", carrier_id)
 
-    data, error = call_google_script({"action": "get_carrier_drivers", "carrier_id": carrier_id})
+    response, error = call_google_script({"action": "get_carrier_drivers", "carrier_id": carrier_id})
     if error:
         bot.send_message(chat_id, f"❌ Не удалось получить водителей: {error}")
         return
 
-    print("API response =", data)
-    logger.info("get_carrier_drivers raw response=%s", data)
+    if not isinstance(response, dict):
+        response = {}
 
-    # Ожидаемый формат: {"ok": true, "result": {"success": true, "drivers": [...]}}
-    result = data.get("result", {}) if isinstance(data, dict) else {}
+    print("DRIVERS API RESPONSE =", response)
+    logger.info("DRIVERS API RESPONSE = %s", response)
 
-    # Fallback для обратной совместимости со старыми форматами
+    if not response.get("ok"):
+        api_error = response.get("error") or "Некорректный ответ API"
+        bot.send_message(chat_id, f"❌ Не удалось получить водителей: {api_error}")
+        return
+
+    result = response.get("result", {})
     if not isinstance(result, dict):
-        result = _unwrap_google_result(data)
+        bot.send_message(chat_id, "❌ Неожиданный формат ответа API (result).")
+        return
 
-    if isinstance(result, dict) and result.get("success") is False:
+    if not result.get("success"):
         bot.send_message(chat_id, f"❌ Ошибка списка водителей: {result.get('error', 'неизвестная ошибка')}")
         return
 
-    drivers = []
-    if isinstance(result, dict):
-        drivers = result.get("drivers", []) or []
-    elif isinstance(result, list):
-        drivers = result
+    drivers = result.get("drivers", [])
+    if not isinstance(drivers, list):
+        drivers = []
 
-    print("Drivers list =", drivers)
-    logger.info("get_carrier_drivers parsed drivers count=%s", len(drivers))
-
-    session = get_session(chat_id)
-    session["state"] = "trip_request_select_driver"
-    session["trip_drivers_map"] = {}
-
+    normalized_drivers = []
     markup = InlineKeyboardMarkup()
     for idx, driver in enumerate(drivers[:80]):
-        driver_id = _extract_id(driver, ["id", "driver_id"])
-        name = str(driver.get("full_name") or driver.get("name") or driver.get("driver_name") or "").strip() or f"Водитель {idx+1}"
-        phone = str(driver.get("phone") or driver.get("driver_phone") or "").strip()
+        if not isinstance(driver, dict):
+            continue
+
+        driver_id = _extract_id(driver, ["driver_id", "id"])
         if not driver_id:
             driver_id = f"driver_{idx}"
 
-        session["trip_drivers_map"][str(idx)] = {
-            "id": driver_id,
-            "driver_name": name,
-            "driver_phone": phone,
-            "raw": driver,
-        }
-        label = f"{name} ({phone})" if phone else name
-        markup.add(InlineKeyboardButton(label, callback_data=f"trip_driver_{idx}"))
+        driver_name = str(driver.get("driver_name") or driver.get("full_name") or driver.get("name") or "").strip() or f"Водитель {idx + 1}"
+        driver_phone = str(driver.get("driver_phone") or driver.get("phone") or "").strip()
+
+        normalized_driver = dict(driver)
+        normalized_driver["driver_id"] = driver_id
+        normalized_driver["driver_name"] = driver_name
+        normalized_driver["driver_phone"] = driver_phone
+        normalized_drivers.append(normalized_driver)
+
+        button_text = f"{driver_name} {driver_phone}".strip()
+        markup.add(InlineKeyboardButton(button_text, callback_data=f"trip_driver:{driver_id}"))
+
+    print("DRIVERS PARSED =", normalized_drivers)
+    logger.info("DRIVERS PARSED = %s", normalized_drivers)
+
+    session = get_session(chat_id)
+    session["state"] = "trip_request_select_driver"
+    session["trip_drivers_map"] = {d.get("driver_id", f"driver_{i}"): d for i, d in enumerate(normalized_drivers)}
+    session["drivers"] = normalized_drivers
 
     markup.add(InlineKeyboardButton("Без водителя", callback_data="trip_driver_none"))
     markup.add(InlineKeyboardButton("➕ Добавить водителя", callback_data="trip_driver_add"))
@@ -2885,7 +2896,7 @@ def handle_trip_vehicle_actions(call):
     _trip_show_drivers(chat_id, data.get("carrier_id", ""))
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("trip_driver_") or call.data in ("trip_driver_none", "trip_driver_add"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith("trip_driver:") or call.data.startswith("trip_driver_") or call.data in ("trip_driver_none", "trip_driver_add"))
 def handle_trip_driver_actions(call):
     chat_id = call.message.chat.id
 
@@ -2912,15 +2923,37 @@ def handle_trip_driver_actions(call):
         _trip_prompt_field(chat_id, TRIP_REQUEST_FIELD_ORDER[0])
         return
 
-    token = call.data.replace("trip_driver_", "", 1)
-    driver = (session.get("trip_drivers_map") or {}).get(token)
+    driver_id = ""
+    if call.data.startswith("trip_driver:"):
+        driver_id = call.data.split(":", 1)[1].strip()
+
+    driver = None
+    drivers = session.get("drivers") or []
+    if driver_id:
+        for item in drivers:
+            if not isinstance(item, dict):
+                continue
+            item_id = _extract_id(item, ["driver_id", "id"])
+            if item_id == driver_id:
+                driver = item
+                break
+
+    # Fallback для уже отправленных старых кнопок вида trip_driver_<idx>
+    if driver is None and call.data.startswith("trip_driver_"):
+        legacy_token = call.data.replace("trip_driver_", "", 1)
+        legacy_map = session.get("trip_drivers_map") or {}
+        if legacy_token in legacy_map:
+            driver = legacy_map.get(legacy_token)
+        elif legacy_token:
+            driver = legacy_map.get(legacy_token)
+
     if not driver:
         bot.answer_callback_query(call.id, "Список устарел. Начните заново.")
         return
 
-    data["driver_id"] = driver.get("id", "")
-    data["driver_name"] = driver.get("driver_name", "")
-    data["driver_phone"] = driver.get("driver_phone", "")
+    data["driver_id"] = _extract_id(driver, ["driver_id", "id"])
+    data["driver_name"] = str(driver.get("driver_name") or driver.get("full_name") or driver.get("name") or "").strip()
+    data["driver_phone"] = str(driver.get("driver_phone") or driver.get("phone") or "").strip()
     session["trip_request_data"] = data
     save_session(chat_id, session)
 
