@@ -3076,23 +3076,22 @@ def handle_trip_finalize(call):
 
     print("CREATE TRIP REQUEST RESPONSE =", json.dumps(response, indent=2, ensure_ascii=False))
 
-    result = _unwrap_google_result(response)
-    if isinstance(result, dict) and result.get("success"):
-        request_number = result.get("requestNumber") or result.get("request_number") or result.get("number") or "—"
-        request_date = result.get("requestDate") or result.get("date") or "—"
-        doc_url = result.get("docUrl") or result.get("doc_url") or result.get("url") or ""
-        pdf_url = result.get("pdfUrl") or result.get("pdf_url") or ""
+    result = response.get("result", {}) if isinstance(response, dict) else {}
+    if not isinstance(result, dict):
+        result = {}
 
-        msg = [
-            "✅ Договор-заявка создана!",
-            f"Номер: {request_number}",
-            f"Дата: {request_date}",
-        ]
-        if doc_url:
-            msg.append(f"Документ: {doc_url}")
-        if pdf_url:
-            msg.append(f"PDF: {pdf_url}")
-        bot.send_message(chat_id, "\n".join(msg))
+    if isinstance(response, dict) and response.get("ok") and result.get("docUrl"):
+        request_number = result.get("requestNumber", "")
+        doc_url = result.get("docUrl", "")
+        pdf_url = result.get("pdfUrl", "")
+
+        bot.send_message(
+            chat_id,
+            "✅ Договор-заявка создана\n\n"
+            f"Номер: {request_number}\n"
+            f"📄 Документ: {doc_url}\n"
+            f"📑 PDF: {pdf_url}",
+        )
 
         session = _clean_trip_request_state(session)
         save_session(chat_id, session)
@@ -3100,13 +3099,7 @@ def handle_trip_finalize(call):
 
     error_text = (
         (response.get("error") if isinstance(response, dict) else None)
-        or (result.get("error") if isinstance(result, dict) else None)
-        or (
-            (response.get("result", {}) or {}).get("error")
-            if isinstance(response, dict) and isinstance(response.get("result"), dict)
-            else None
-        )
-        or (response.get("message") if isinstance(response, dict) else None)
+        or result.get("error")
         or str(response)
     )
     bot.send_message(chat_id, "❌ Не удалось создать договор-заявку:\n" + str(error_text))
