@@ -2699,6 +2699,11 @@ def start_trip_request_fsm(chat_id: int):
     _trip_show_customers(chat_id)
 
 
+def start_new_trip_request_fsm(chat_id: int):
+    """Явная точка входа для кнопки "📦 Новая заявка" (новый FSM flow)."""
+    start_trip_request_fsm(chat_id)
+
+
 def _trip_build_create_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "action": "create_trip_request",
@@ -3981,7 +3986,7 @@ def handle_btn_new_contract(message):
 
 @bot.message_handler(func=lambda m: m.text == "📦 Новая заявка")
 def handle_btn_new_request(message):
-    start_trip_request_fsm(message.chat.id)
+    start_new_trip_request_fsm(message.chat.id)
 
 
 @bot.message_handler(func=lambda m: m.text == "📄 Мои заявки")
@@ -5411,7 +5416,7 @@ def menu_add_vehicle(message):
 @bot.message_handler(func=lambda msg: msg.text == "📦 Новая заявка")
 def menu_new_order(message):
     """Кнопка меню: Новая заявка."""
-    start_trip_request_fsm(message.chat.id)
+    start_new_trip_request_fsm(message.chat.id)
 
 
 @bot.message_handler(func=lambda msg: msg.text == "📋 Мои заявки")
@@ -5465,7 +5470,7 @@ def handle_create_contract_command(message):
 
 
 def handle_new_order_command(message):
-    start_trip_request_fsm(message.chat.id)
+    start_new_trip_request_fsm(message.chat.id)
 
 
 def handle_my_orders_command(message):
