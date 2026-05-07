@@ -2286,6 +2286,729 @@ def show_carrier_drivers(message, carrier_id, vehicle_id):
     bot.send_message(chat_id, "Выберите водителя:", reply_markup=markup)
 
 
+
+
+# =========================
+# FSM: СОЗДАНИЕ ДОГОВОР-ЗАЯВКИ
+# =========================
+
+TRIP_REQUEST_DEFAULT_PAYMENT_TERMS = (
+    "Безналичный расчет после предоставления оригиналов ТН, счета и акта"
+)
+
+TRIP_REQUEST_FIELD_ORDER = [
+    "route_name",
+    "loading_datetime",
+    "unloading_datetime",
+    "loading_address",
+    "loading_manager",
+    "loading_manager_phone",
+    "unloading_address",
+    "unloading_manager",
+    "unloading_manager_phone",
+    "cargo_description",
+    "weight",
+    "pallets",
+    "temperature_mode",
+    "price",
+    "vat_type",
+    "payment_terms",
+    "additional_terms",
+]
+
+TRIP_REQUEST_FIELD_PROMPTS = {
+    "route_name": "1/17. Укажите маршрут (например: Иркутск → Братск)",
+    "loading_datetime": "2/17. Укажите дату и время погрузки (например: 12.05.2026 09:30)",
+    "unloading_datetime": "3/17. Укажите дату и время выгрузки (например: 13.05.2026 18:00)",
+    "loading_address": "4/17. Укажите адрес погрузки",
+    "loading_manager": "5/17. Укажите ответственного на погрузке (ФИО)",
+    "loading_manager_phone": "6/17. Укажите телефон ответственного на погрузке",
+    "unloading_address": "7/17. Укажите адрес выгрузки",
+    "unloading_manager": "8/17. Укажите ответственного на выгрузке (ФИО)",
+    "unloading_manager_phone": "9/17. Укажите телефон ответственного на выгрузке",
+    "cargo_description": "10/17. Укажите описание груза",
+    "weight": "11/17. Укажите вес груза (в тоннах)",
+    "pallets": "12/17. Укажите количество паллет",
+    "temperature_mode": "13/17. Укажите температурный режим",
+    "price": "14/17. Укажите ставку (в рублях)",
+}
+
+TRIP_REQUEST_STATE_KEYS = [
+    "trip_request_data",
+    "trip_customers_map",
+    "trip_carriers_map",
+    "trip_vehicles_map",
+    "trip_drivers_map",
+]
+
+
+def _unwrap_google_result(data: Dict[str, Any]) -> Any:
+    if isinstance(data, dict) and data.get("ok") and "result" in data:
+        return data.get("result")
+    return data
+
+
+def _extract_id(item: Dict[str, Any], candidates: List[str]) -> str:
+    for key in candidates:
+        value = item.get(key)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return ""
+
+
+def _clean_trip_request_state(session: Dict[str, Any]) -> Dict[str, Any]:
+    for key in TRIP_REQUEST_STATE_KEYS:
+        session.pop(key, None)
+    if str(session.get("state", "")).startswith("trip_request_"):
+        session["state"] = ""
+    return session
+
+
+def _trip_request_data(session: Dict[str, Any]) -> Dict[str, Any]:
+    data = session.get("trip_request_data")
+    if not isinstance(data, dict):
+        data = {}
+        session["trip_request_data"] = data
+    return data
+
+
+def _format_vehicle_title(vehicle: Dict[str, Any]) -> str:
+    model = str(vehicle.get("vehicle_model") or vehicle.get("model") or "").strip()
+    number = str(vehicle.get("vehicle_number") or vehicle.get("number") or vehicle.get("plate") or "").strip()
+    trailer = str(vehicle.get("trailer_number") or vehicle.get("trailer_plate") or "").strip()
+    line = f"{model} {number}".strip()
+    if trailer:
+        line += f" | прицеп: {trailer}"
+    return line or "Без машины"
+
+
+def _trip_validate_datetime(value: str) -> bool:
+    has_date = bool(re.search(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", value or ""))
+    has_time = bool(re.search(r"\b\d{1,2}:\d{2}\b", value or ""))
+    return has_date and has_time
+
+
+def _trip_validate_field(field: str, value: str) -> Tuple[bool, str, str]:
+    raw = (value or "").strip()
+    if not raw:
+        return False, "", "Поле не может быть пустым."
+
+    if field in ("loading_datetime", "unloading_datetime"):
+        if not _trip_validate_datetime(raw):
+            return False, "", "Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ."
+        return True, raw, ""
+
+    if field in ("loading_manager_phone", "unloading_manager_phone"):
+        phone = normalize_phone(raw)
+        if not phone:
+            return False, "", "Телефон должен быть в формате +7XXXXXXXXXX или 8XXXXXXXXXX."
+        return True, phone, ""
+
+    if field == "weight":
+        try:
+            number = float(raw.replace(",", "."))
+            if number <= 0:
+                return False, "", "Вес должен быть больше 0."
+            return True, str(number).rstrip("0").rstrip("."), ""
+        except ValueError:
+            return False, "", "Вес должен быть числом (например: 20.5)."
+
+    if field == "pallets":
+        try:
+            pallets = int(clean_digits(raw))
+            if pallets <= 0:
+                return False, "", "Количество паллет должно быть больше 0."
+            return True, str(pallets), ""
+        except ValueError:
+            return False, "", "Количество паллет должно быть целым числом."
+
+    if field == "price":
+        digits = clean_digits(raw)
+        if not digits:
+            return False, "", "Ставка должна содержать число."
+        return True, digits, ""
+
+    return True, raw, ""
+
+
+def _trip_next_field(current_field: str) -> str:
+    try:
+        idx = TRIP_REQUEST_FIELD_ORDER.index(current_field)
+    except ValueError:
+        return ""
+    if idx + 1 >= len(TRIP_REQUEST_FIELD_ORDER):
+        return ""
+    return TRIP_REQUEST_FIELD_ORDER[idx + 1]
+
+
+def _trip_prompt_field(chat_id: int, field: str):
+    session = get_session(chat_id)
+    data = _trip_request_data(session)
+    session["state"] = f"trip_request_input_{field}"
+    save_session(chat_id, session)
+
+    if field == "vat_type":
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("с НДС", callback_data="trip_vat_with"))
+        markup.add(InlineKeyboardButton("без НДС", callback_data="trip_vat_without"))
+        bot.send_message(chat_id, "15/17. Выберите НДС:", reply_markup=markup)
+        return
+
+    if field == "payment_terms":
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("✅ Оставить по умолчанию", callback_data="trip_payment_default"))
+        markup.add(InlineKeyboardButton("✏️ Ввести вручную", callback_data="trip_payment_custom"))
+        bot.send_message(
+            chat_id,
+            "16/17. Условия оплаты.\n"
+            f"По умолчанию: {TRIP_REQUEST_DEFAULT_PAYMENT_TERMS}\n\n"
+            "Нажмите кнопку или отправьте свой текст.",
+            reply_markup=markup,
+        )
+        return
+
+    if field == "additional_terms":
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Нет", callback_data="trip_additional_none"))
+        markup.add(InlineKeyboardButton("✏️ Ввести текст", callback_data="trip_additional_custom"))
+        bot.send_message(chat_id, "17/17. Дополнительные условия:", reply_markup=markup)
+        return
+
+    bot.send_message(chat_id, TRIP_REQUEST_FIELD_PROMPTS.get(field, f"Введите {field}:"))
+
+
+def _trip_show_preview(chat_id: int):
+    session = get_session(chat_id)
+    data = _trip_request_data(session)
+
+    preview = [
+        "📋 Предпросмотр договор-заявки:",
+        "",
+        f"Заказчик: {data.get('customer_name', '—')}",
+        f"Перевозчик: {data.get('carrier_name', '—')} (ИНН: {data.get('carrier_inn', '—')})",
+        f"Машина: {_format_vehicle_title(data)}",
+        f"Водитель: {data.get('driver_name', 'Без водителя')} ({data.get('driver_phone', '—') or '—'})",
+        "",
+        f"Маршрут: {data.get('route_name', '—')}",
+        f"Погрузка: {data.get('loading_datetime', '—')} | {data.get('loading_address', '—')}",
+        f"Ответственный погрузка: {data.get('loading_manager', '—')} ({data.get('loading_manager_phone', '—')})",
+        f"Выгрузка: {data.get('unloading_datetime', '—')} | {data.get('unloading_address', '—')}",
+        f"Ответственный выгрузка: {data.get('unloading_manager', '—')} ({data.get('unloading_manager_phone', '—')})",
+        f"Груз: {data.get('cargo_description', '—')}",
+        f"Вес: {data.get('weight', '—')} т",
+        f"Паллеты: {data.get('pallets', '—')}",
+        f"Температурный режим: {data.get('temperature_mode', '—')}",
+        f"Ставка: {data.get('price', '—')} руб.",
+        f"НДС: {data.get('vat_type', '—')}",
+        f"Условия оплаты: {data.get('payment_terms', '—')}",
+        f"Доп. условия: {data.get('additional_terms', '—')}",
+    ]
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Создать договор-заявку", callback_data="trip_create_confirm"))
+    markup.add(InlineKeyboardButton("❌ Отменить", callback_data="trip_cancel"))
+
+    session["state"] = "trip_request_preview"
+    save_session(chat_id, session)
+    bot.send_message(chat_id, "\n".join(preview), reply_markup=markup)
+
+
+def _trip_show_customers(chat_id: int):
+    data, error = call_google_script({"action": "list_customers"})
+    if error:
+        bot.send_message(chat_id, f"❌ Не удалось получить заказчиков: {error}")
+        return
+
+    result = _unwrap_google_result(data)
+    customers = []
+    if isinstance(result, list):
+        customers = result
+    elif isinstance(result, dict):
+        customers = result.get("customers", []) or []
+
+    if not customers:
+        bot.send_message(chat_id, "❌ Заказчики не найдены. Сначала добавьте заказчика.")
+        return
+
+    session = get_session(chat_id)
+    session["state"] = "trip_request_select_customer"
+    session["trip_customers_map"] = {}
+    markup = InlineKeyboardMarkup()
+
+    for idx, customer in enumerate(customers[:50]):
+        cid = _extract_id(customer, ["id", "customer_id", "code"])
+        name = str(customer.get("name") or customer.get("customer_name") or cid or "Без названия")
+        if not cid:
+            cid = f"customer_{idx}"
+        session["trip_customers_map"][str(idx)] = {
+            "id": cid,
+            "name": name,
+            "raw": customer,
+        }
+        markup.add(InlineKeyboardButton(name, callback_data=f"trip_customer_{idx}"))
+
+    save_session(chat_id, session)
+    bot.send_message(chat_id, "1/5. Выберите заказчика:", reply_markup=markup)
+
+
+def _trip_show_carriers(chat_id: int):
+    data, error = call_google_script({"action": "list_carriers"})
+    if error:
+        bot.send_message(chat_id, f"❌ Не удалось получить перевозчиков: {error}")
+        return
+
+    result = _unwrap_google_result(data)
+    carriers = []
+    if isinstance(result, dict):
+        carriers = result.get("carriers", []) or []
+    elif isinstance(result, list):
+        carriers = result
+
+    if not carriers:
+        bot.send_message(chat_id, "❌ Перевозчики не найдены. Сначала добавьте перевозчика.")
+        return
+
+    session = get_session(chat_id)
+    session["state"] = "trip_request_select_carrier"
+    session["trip_carriers_map"] = {}
+    markup = InlineKeyboardMarkup()
+
+    for idx, carrier in enumerate(carriers[:70]):
+        carrier_id = _extract_id(carrier, ["id", "carrier_id"])
+        carrier_name = str(carrier.get("name") or carrier.get("carrier_name") or carrier_id or "Без названия")
+        carrier_inn = clean_digits(str(carrier.get("inn") or ""))
+        if not carrier_id:
+            carrier_id = f"carrier_{idx}"
+        session["trip_carriers_map"][str(idx)] = {
+            "id": carrier_id,
+            "name": carrier_name,
+            "inn": carrier_inn,
+            "raw": carrier,
+        }
+        title = f"{carrier_name} ({carrier_inn})" if carrier_inn else carrier_name
+        markup.add(InlineKeyboardButton(title, callback_data=f"trip_carrier_{idx}"))
+
+    save_session(chat_id, session)
+    bot.send_message(chat_id, "2/5. Выберите перевозчика:", reply_markup=markup)
+
+
+def _trip_show_vehicles(chat_id: int, carrier_id: str):
+    data, error = call_google_script({"action": "get_carrier_vehicles", "carrier_id": carrier_id})
+    if error:
+        bot.send_message(chat_id, f"❌ Не удалось получить машины: {error}")
+        return
+
+    result = _unwrap_google_result(data)
+    if isinstance(result, dict) and result.get("success") is False:
+        bot.send_message(chat_id, f"❌ Ошибка списка машин: {result.get('error', 'неизвестная ошибка')}")
+        return
+
+    vehicles = []
+    if isinstance(result, dict):
+        vehicles = result.get("vehicles", []) or []
+    elif isinstance(result, list):
+        vehicles = result
+
+    session = get_session(chat_id)
+    session["state"] = "trip_request_select_vehicle"
+    session["trip_vehicles_map"] = {}
+
+    markup = InlineKeyboardMarkup()
+    for idx, vehicle in enumerate(vehicles[:80]):
+        vehicle_id = _extract_id(vehicle, ["id", "vehicle_id"])
+        number = str(vehicle.get("number") or vehicle.get("plate") or "").strip()
+        brand = str(vehicle.get("brand") or "").strip()
+        model = str(vehicle.get("model") or "").strip()
+        trailer = str(vehicle.get("trailer_number") or vehicle.get("trailer_plate") or "").strip()
+        title = " ".join([brand, model, number]).strip() or f"Машина {idx+1}"
+        if trailer:
+            title += f" | прицеп: {trailer}"
+        if not vehicle_id:
+            vehicle_id = f"vehicle_{idx}"
+
+        session["trip_vehicles_map"][str(idx)] = {
+            "id": vehicle_id,
+            "vehicle_number": number,
+            "vehicle_model": " ".join([brand, model]).strip(),
+            "trailer_number": trailer,
+            "raw": vehicle,
+        }
+        markup.add(InlineKeyboardButton(title, callback_data=f"trip_vehicle_{idx}"))
+
+    markup.add(InlineKeyboardButton("Без машины", callback_data="trip_vehicle_none"))
+    markup.add(InlineKeyboardButton("➕ Добавить машину", callback_data="trip_vehicle_add"))
+
+    save_session(chat_id, session)
+    bot.send_message(chat_id, "3/5. Выберите машину:", reply_markup=markup)
+
+
+def _trip_show_drivers(chat_id: int, carrier_id: str):
+    data, error = call_google_script({"action": "get_carrier_drivers", "carrier_id": carrier_id})
+    if error:
+        bot.send_message(chat_id, f"❌ Не удалось получить водителей: {error}")
+        return
+
+    result = _unwrap_google_result(data)
+    if isinstance(result, dict) and result.get("success") is False:
+        bot.send_message(chat_id, f"❌ Ошибка списка водителей: {result.get('error', 'неизвестная ошибка')}")
+        return
+
+    drivers = []
+    if isinstance(result, dict):
+        drivers = result.get("drivers", []) or []
+    elif isinstance(result, list):
+        drivers = result
+
+    session = get_session(chat_id)
+    session["state"] = "trip_request_select_driver"
+    session["trip_drivers_map"] = {}
+
+    markup = InlineKeyboardMarkup()
+    for idx, driver in enumerate(drivers[:80]):
+        driver_id = _extract_id(driver, ["id", "driver_id"])
+        name = str(driver.get("full_name") or driver.get("name") or "").strip() or f"Водитель {idx+1}"
+        phone = str(driver.get("phone") or "").strip()
+        if not driver_id:
+            driver_id = f"driver_{idx}"
+
+        session["trip_drivers_map"][str(idx)] = {
+            "id": driver_id,
+            "driver_name": name,
+            "driver_phone": phone,
+            "raw": driver,
+        }
+        label = f"{name} ({phone})" if phone else name
+        markup.add(InlineKeyboardButton(label, callback_data=f"trip_driver_{idx}"))
+
+    markup.add(InlineKeyboardButton("Без водителя", callback_data="trip_driver_none"))
+    markup.add(InlineKeyboardButton("➕ Добавить водителя", callback_data="trip_driver_add"))
+
+    save_session(chat_id, session)
+    bot.send_message(chat_id, "4/5. Выберите водителя:", reply_markup=markup)
+
+
+def start_trip_request_fsm(chat_id: int):
+    session = get_session(chat_id)
+    session = _clean_trip_request_state(session)
+    session["scenario"] = "existing_carrier_trip_request"
+    session["trip_request_data"] = {}
+    session["state"] = "trip_request_select_customer"
+    save_session(chat_id, session)
+
+    bot.send_message(chat_id, "📦 Запускаю пошаговое создание договор-заявки (5 этапов).")
+    _trip_show_customers(chat_id)
+
+
+def _trip_build_create_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "action": "create_trip_request",
+        "customer_id": data.get("customer_id", ""),
+        "customer_name": data.get("customer_name", ""),
+        "carrier_id": data.get("carrier_id", ""),
+        "carrier_name": data.get("carrier_name", ""),
+        "carrier_inn": data.get("carrier_inn", ""),
+        "vehicle_id": data.get("vehicle_id", ""),
+        "vehicle_number": data.get("vehicle_number", ""),
+        "vehicle_model": data.get("vehicle_model", ""),
+        "trailer_number": data.get("trailer_number", ""),
+        "driver_id": data.get("driver_id", ""),
+        "driver_name": data.get("driver_name", ""),
+        "driver_phone": data.get("driver_phone", ""),
+        "route_name": data.get("route_name", ""),
+        "loading_datetime": data.get("loading_datetime", ""),
+        "unloading_datetime": data.get("unloading_datetime", ""),
+        "loading_address": data.get("loading_address", ""),
+        "loading_manager": data.get("loading_manager", ""),
+        "loading_manager_phone": data.get("loading_manager_phone", ""),
+        "unloading_address": data.get("unloading_address", ""),
+        "unloading_manager": data.get("unloading_manager", ""),
+        "unloading_manager_phone": data.get("unloading_manager_phone", ""),
+        "cargo_description": data.get("cargo_description", ""),
+        "weight": data.get("weight", ""),
+        "pallets": data.get("pallets", ""),
+        "temperature_mode": data.get("temperature_mode", ""),
+        "price": data.get("price", ""),
+        "vat_type": data.get("vat_type", ""),
+        "payment_terms": data.get("payment_terms", TRIP_REQUEST_DEFAULT_PAYMENT_TERMS),
+        "additional_terms": data.get("additional_terms", "Нет"),
+    }
+
+
+def process_trip_request_text_input(chat_id: int, text: str) -> bool:
+    session = get_session(chat_id)
+    state = str(session.get("state", ""))
+
+    if not state.startswith("trip_request_"):
+        return False
+
+    if state in {
+        "trip_request_select_customer",
+        "trip_request_select_carrier",
+        "trip_request_select_vehicle",
+        "trip_request_select_driver",
+        "trip_request_preview",
+    }:
+        bot.send_message(chat_id, "Пожалуйста, используйте кнопки под сообщением для продолжения.")
+        return True
+
+    if not state.startswith("trip_request_input_"):
+        return False
+
+    field = state.replace("trip_request_input_", "", 1)
+
+    if field in ("vat_type", "additional_terms"):
+        bot.send_message(chat_id, "Используйте кнопки ниже для выбора варианта.")
+        return True
+
+    is_ok, cleaned, error = _trip_validate_field(field, text)
+    if not is_ok:
+        bot.send_message(chat_id, f"⚠️ {error}")
+        return True
+
+    data = _trip_request_data(session)
+    data[field] = cleaned
+    session["trip_request_data"] = data
+    save_session(chat_id, session)
+
+    next_field = _trip_next_field(field)
+    if not next_field:
+        _trip_show_preview(chat_id)
+    else:
+        _trip_prompt_field(chat_id, next_field)
+    return True
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("trip_customer_"))
+def handle_trip_customer_select(call):
+    chat_id = call.message.chat.id
+    token = call.data.replace("trip_customer_", "", 1)
+
+    session = get_session(chat_id)
+    customer = (session.get("trip_customers_map") or {}).get(token)
+    if not customer:
+        bot.answer_callback_query(call.id, "Список устарел. Начните заново.")
+        return
+
+    data = _trip_request_data(session)
+    data["customer_id"] = customer.get("id", "")
+    data["customer_name"] = customer.get("name", "")
+    session["trip_request_data"] = data
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "Заказчик выбран")
+    _trip_show_carriers(chat_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("trip_carrier_"))
+def handle_trip_carrier_select(call):
+    chat_id = call.message.chat.id
+    token = call.data.replace("trip_carrier_", "", 1)
+
+    session = get_session(chat_id)
+    carrier = (session.get("trip_carriers_map") or {}).get(token)
+    if not carrier:
+        bot.answer_callback_query(call.id, "Список устарел. Начните заново.")
+        return
+
+    data = _trip_request_data(session)
+    data["carrier_id"] = carrier.get("id", "")
+    data["carrier_name"] = carrier.get("name", "")
+    data["carrier_inn"] = carrier.get("inn", "")
+    session["trip_request_data"] = data
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "Перевозчик выбран")
+    _trip_show_vehicles(chat_id, carrier.get("id", ""))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("trip_vehicle_") or call.data in ("trip_vehicle_none", "trip_vehicle_add"))
+def handle_trip_vehicle_actions(call):
+    chat_id = call.message.chat.id
+
+    if call.data == "trip_vehicle_add":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "Добавление машины будет отдельным сценарием. Сейчас выберите существующую запись или нажмите 'Без машины'.",
+        )
+        return
+
+    session = get_session(chat_id)
+    data = _trip_request_data(session)
+
+    if call.data == "trip_vehicle_none":
+        data["vehicle_id"] = ""
+        data["vehicle_number"] = ""
+        data["vehicle_model"] = ""
+        data["trailer_number"] = ""
+        session["trip_request_data"] = data
+        save_session(chat_id, session)
+
+        bot.answer_callback_query(call.id, "Продолжаем без машины")
+        _trip_show_drivers(chat_id, data.get("carrier_id", ""))
+        return
+
+    token = call.data.replace("trip_vehicle_", "", 1)
+    vehicle = (session.get("trip_vehicles_map") or {}).get(token)
+    if not vehicle:
+        bot.answer_callback_query(call.id, "Список устарел. Начните заново.")
+        return
+
+    data["vehicle_id"] = vehicle.get("id", "")
+    data["vehicle_number"] = vehicle.get("vehicle_number", "")
+    data["vehicle_model"] = vehicle.get("vehicle_model", "")
+    data["trailer_number"] = vehicle.get("trailer_number", "")
+    session["trip_request_data"] = data
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "Машина выбрана")
+    _trip_show_drivers(chat_id, data.get("carrier_id", ""))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("trip_driver_") or call.data in ("trip_driver_none", "trip_driver_add"))
+def handle_trip_driver_actions(call):
+    chat_id = call.message.chat.id
+
+    if call.data == "trip_driver_add":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "Добавление водителя будет отдельным сценарием. Сейчас выберите существующую запись или нажмите 'Без водителя'.",
+        )
+        return
+
+    session = get_session(chat_id)
+    data = _trip_request_data(session)
+
+    if call.data == "trip_driver_none":
+        data["driver_id"] = ""
+        data["driver_name"] = "Без водителя"
+        data["driver_phone"] = ""
+        session["trip_request_data"] = data
+        save_session(chat_id, session)
+
+        bot.answer_callback_query(call.id, "Продолжаем без водителя")
+        bot.send_message(chat_id, "5/5. Переходим к заполнению данных рейса.")
+        _trip_prompt_field(chat_id, TRIP_REQUEST_FIELD_ORDER[0])
+        return
+
+    token = call.data.replace("trip_driver_", "", 1)
+    driver = (session.get("trip_drivers_map") or {}).get(token)
+    if not driver:
+        bot.answer_callback_query(call.id, "Список устарел. Начните заново.")
+        return
+
+    data["driver_id"] = driver.get("id", "")
+    data["driver_name"] = driver.get("driver_name", "")
+    data["driver_phone"] = driver.get("driver_phone", "")
+    session["trip_request_data"] = data
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "Водитель выбран")
+    bot.send_message(chat_id, "5/5. Переходим к заполнению данных рейса.")
+    _trip_prompt_field(chat_id, TRIP_REQUEST_FIELD_ORDER[0])
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("trip_vat_with", "trip_vat_without"))
+def handle_trip_vat_select(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    data = _trip_request_data(session)
+
+    data["vat_type"] = "с НДС" if call.data == "trip_vat_with" else "без НДС"
+    session["trip_request_data"] = data
+    save_session(chat_id, session)
+
+    bot.answer_callback_query(call.id, "НДС сохранен")
+    _trip_prompt_field(chat_id, _trip_next_field("vat_type"))
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("trip_payment_default", "trip_payment_custom"))
+def handle_trip_payment_mode(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    data = _trip_request_data(session)
+
+    if call.data == "trip_payment_default":
+        data["payment_terms"] = TRIP_REQUEST_DEFAULT_PAYMENT_TERMS
+        session["trip_request_data"] = data
+        save_session(chat_id, session)
+        bot.answer_callback_query(call.id, "Условия оплаты сохранены")
+        _trip_prompt_field(chat_id, _trip_next_field("payment_terms"))
+        return
+
+    session["state"] = "trip_request_input_payment_terms"
+    save_session(chat_id, session)
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "Введите условия оплаты текстом:")
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("trip_additional_none", "trip_additional_custom"))
+def handle_trip_additional_terms(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+    data = _trip_request_data(session)
+
+    if call.data == "trip_additional_none":
+        data["additional_terms"] = "Нет"
+        session["trip_request_data"] = data
+        save_session(chat_id, session)
+        bot.answer_callback_query(call.id, "Сохранено")
+        _trip_show_preview(chat_id)
+        return
+
+    session["state"] = "trip_request_input_additional_terms"
+    save_session(chat_id, session)
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "Введите дополнительные условия:")
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("trip_create_confirm", "trip_cancel"))
+def handle_trip_finalize(call):
+    chat_id = call.message.chat.id
+    session = get_session(chat_id)
+
+    if call.data == "trip_cancel":
+        session = _clean_trip_request_state(session)
+        save_session(chat_id, session)
+        bot.answer_callback_query(call.id, "Отменено")
+        bot.send_message(chat_id, "❌ Создание договор-заявки отменено.")
+        return
+
+    bot.answer_callback_query(call.id, "Создаю заявку...")
+    data = _trip_request_data(session)
+    payload = _trip_build_create_payload(data)
+
+    gs_data, gs_error = call_google_script(payload)
+    if gs_error:
+        bot.send_message(chat_id, f"❌ Не удалось создать договор-заявку: {gs_error}")
+        return
+
+    result = _unwrap_google_result(gs_data)
+    if isinstance(result, dict) and result.get("success"):
+        request_number = result.get("requestNumber") or result.get("request_number") or result.get("number") or "—"
+        request_date = result.get("requestDate") or result.get("date") or "—"
+        doc_url = result.get("docUrl") or result.get("url") or ""
+        pdf_url = result.get("pdfUrl") or ""
+
+        msg = [
+            "✅ Договор-заявка создана!",
+            f"Номер: {request_number}",
+            f"Дата: {request_date}",
+        ]
+        if doc_url:
+            msg.append(f"Документ: {doc_url}")
+        if pdf_url:
+            msg.append(f"PDF: {pdf_url}")
+        bot.send_message(chat_id, "\n".join(msg))
+
+        session = _clean_trip_request_state(session)
+        save_session(chat_id, session)
+        return
+
+    err = result.get("error", "Неизвестная ошибка") if isinstance(result, dict) else "Неожиданный формат ответа"
+    bot.send_message(chat_id, f"❌ Не удалось создать договор-заявку: {err}")
+
 def handle_voice_command(message, text: str):
     text_lower = (text or "").lower()
 
@@ -3258,7 +3981,7 @@ def handle_btn_new_contract(message):
 
 @bot.message_handler(func=lambda m: m.text == "📦 Новая заявка")
 def handle_btn_new_request(message):
-    bot.send_message(message.chat.id, "📦 Опишите заявку текстом — маршрут, количество палет, температурный режим.")
+    start_trip_request_fsm(message.chat.id)
 
 
 @bot.message_handler(func=lambda m: m.text == "📄 Мои заявки")
@@ -4688,7 +5411,7 @@ def menu_add_vehicle(message):
 @bot.message_handler(func=lambda msg: msg.text == "📦 Новая заявка")
 def menu_new_order(message):
     """Кнопка меню: Новая заявка."""
-    bot.send_message(message.chat.id, "📦 Опишите заявку текстом — маршрут, количество палет, температурный режим.")
+    start_trip_request_fsm(message.chat.id)
 
 
 @bot.message_handler(func=lambda msg: msg.text == "📋 Мои заявки")
@@ -4742,7 +5465,7 @@ def handle_create_contract_command(message):
 
 
 def handle_new_order_command(message):
-    menu_new_order(message)
+    start_trip_request_fsm(message.chat.id)
 
 
 def handle_my_orders_command(message):
@@ -5366,6 +6089,9 @@ def handle_text(message):
     try:
         session = get_session(chat_id)
         state = session.get("state", "")
+
+        if state.startswith("trip_request_") and process_trip_request_text_input(chat_id, user_text):
+            return
 
         if state == "waiting_driver_photo":
             extracted = extract_driver_from_text(user_text)
